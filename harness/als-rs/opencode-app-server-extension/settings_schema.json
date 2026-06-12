@@ -1,0 +1,157 @@
+{
+  "version": "1",
+  "cache": "none",
+  "description": "Settings schema for the OpenCode app-server extension",
+  "fields": [
+    {
+      "id": "cwd",
+      "type": "path",
+      "label": "Working Directory",
+      "placeholder": "~/project",
+      "default": "~",
+      "required": true,
+      "browse": true
+    },
+    {
+      "id": "session",
+      "type": "session_picker",
+      "label": "Session",
+      "placeholder": "(new session) or type/paste OpenCode session ID",
+      "source": "/api/extensions/opencode-app-server/sessions",
+      "source_method": "extension.sessions.list",
+      "resume_endpoint": "/api/extensions/opencode-app-server/sessions/resume",
+      "binding": {
+        "role": "provider_session",
+        "id_path": "session_id",
+        "label_path": "summary",
+        "created_at_path": "created_at",
+        "updated_at_path": "updated_at",
+        "persist": false
+      },
+      "picker_sort": {
+        "param": "sort",
+        "default": "updated_at",
+        "options": [
+          { "value": "updated_at", "label": "MRU" },
+          { "value": "created_at", "label": "Created" }
+        ]
+      }
+    },
+    {
+      "id": "provider",
+      "type": "select",
+      "label": "Provider",
+      "options": [],
+      "source_method": "extension.schemaInteraction.run",
+      "source": {
+        "action": "provider.current.list",
+        "params": {
+          "cwd": "$field.cwd"
+        }
+      },
+      "options_path": "items",
+      "option_value_path": "id",
+      "option_label_path": "label",
+      "placeholder": "Use OpenCode default provider",
+      "default": "",
+      "semantic": {
+        "role": "provider",
+        "runtime_key": "provider"
+      }
+    },
+    {
+      "id": "model",
+      "type": "select",
+      "label": "Model",
+      "options": [],
+      "dynamic_source": "/api/extensions/opencode-app-server/models",
+      "source_method": "extension.models.list",
+      "source_params": {
+        "provider": "$field.provider"
+      },
+      "depends_on": ["provider"],
+      "refresh_on": ["provider"],
+      "placeholder": "Use OpenCode default model",
+      "default": "",
+      "semantic": {
+        "role": "model",
+        "runtime_key": "model"
+      },
+      "write_back": {
+        "on_select": [
+          { "field": "provider", "path": "provider", "fallback_path": "providerID" },
+          { "field": "model", "path": "id", "fallback_path": "value" }
+        ]
+      }
+    },
+    {
+      "id": "reasoning_effort",
+      "type": "select",
+      "label": "Reasoning Effort",
+      "options": [],
+      "source_method": "extension.schemaInteraction.run",
+      "source": {
+        "action": "model.variants.list",
+        "params": {
+          "provider": "$field.provider",
+          "model": "$field.model",
+          "cwd": "$field.cwd"
+        }
+      },
+      "options_path": "items",
+      "option_value_path": "value",
+      "option_label_path": "label",
+      "default_path": "default",
+      "depends_on": ["provider", "model"],
+      "refresh_on": ["provider", "model"],
+      "placeholder": "Select model first",
+      "default": ""
+    },
+    {
+      "id": "developer_instructions",
+      "type": "textarea",
+      "label": "Developer Instructions",
+      "placeholder": "Additional runtime instructions appended to the OpenCode app-server system context",
+      "rows": 6,
+      "default": ""
+    },
+    {
+      "id": "user_developer_instructions",
+      "type": "textarea",
+      "label": "User Developer Instructions",
+      "placeholder": "User-owned runtime instructions for this provider session",
+      "rows": 6,
+      "default": ""
+    },
+    {
+      "id": "approval_policy",
+      "type": "select",
+      "label": "Approval Policy",
+      "options": [],
+      "dynamic_source": "/api/appserver/runtime_options",
+      "dynamic_options_key": "approval",
+      "source_method": "extension.runtimeOptions.get",
+      "placeholder": "Ask",
+      "default": "ask",
+      "semantic": {
+        "role": "approval_policy",
+        "runtime_key": "approval",
+        "label": "Approval"
+      }
+    },
+    {
+      "id": "sandbox_policy",
+      "type": "select",
+      "label": "Sandbox Policy",
+      "options": [],
+      "dynamic_source": "/api/appserver/runtime_options",
+      "dynamic_options_key": "sandbox",
+      "source_method": "extension.runtimeOptions.get",
+      "placeholder": "Use app-server default",
+      "default": "inherit",
+      "runtime_option": {
+        "kind": "sandbox"
+      }
+    }
+  ]
+}

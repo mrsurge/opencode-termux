@@ -40,6 +40,7 @@ import { ToolOutputStore } from "./tool-output-store"
 import { AppProcess } from "./process"
 import { SessionStore } from "./session/store"
 import { SessionTodo } from "./session/todo"
+import { SessionInstructionOverlay } from "./session-instruction-overlay"
 import { QuestionV2 } from "./question"
 import { LLMClient } from "@opencode-ai/llm"
 import { RequestExecutor } from "@opencode-ai/llm/route"
@@ -71,6 +72,7 @@ export class LocationServiceMap extends LayerMap.Service<LocationServiceMap>()("
       Watcher.locationLayer,
       Pty.locationLayer,
       SkillV2.locationLayer,
+      SessionInstructionOverlay.locationLayer,
       systemContext,
       LocationMutation.locationLayer.pipe(Layer.orDie),
     ).pipe(Layer.provideMerge(location))
