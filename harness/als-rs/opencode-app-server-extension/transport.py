@@ -261,6 +261,8 @@ def _turn_usage(params: Dict[str, object]) -> Dict[str, object]:
 
 
 def _result_value(result: object) -> object:
+    if isinstance(result, str):
+        return result
     return _object_dict(result).get("value")
 
 
@@ -396,6 +398,7 @@ def _tool_display_arguments(
     }
     path = (
         _optional_str(arguments.get("path"))
+        or _optional_str(arguments.get("filePath"))
         or _optional_str(arguments.get("file_path"))
         or _optional_str(arguments.get("absolute_path"))
         or (str(files[0].get("path") or "") if files else "")
@@ -564,16 +567,27 @@ def _apply_patch_structured_file_changes(
 ) -> List[Dict[str, object]]:
     structured_dict = _object_dict(structured)
     applied = structured_dict.get("applied")
-    if not isinstance(applied, list):
+    files = structured_dict.get("files")
+    if isinstance(applied, list):
+        entries = list(cast(List[object], applied))
+    elif isinstance(files, list):
+        entries = list(cast(List[object], files))
+    else:
         return []
     changes: List[Dict[str, object]] = []
-    for item in cast(List[object], applied):
+    for item in entries:
         entry = _object_dict(item)
         diff = _optional_str(entry.get("patch")) or _optional_str(entry.get("diff"))
         if not diff:
             continue
         operation = _optional_str(entry.get("type")) or ""
-        path = _optional_str(entry.get("resource")) or _optional_str(entry.get("target")) or ""
+        path = (
+            _optional_str(entry.get("filePath"))
+            or _optional_str(entry.get("relativePath"))
+            or _optional_str(entry.get("resource"))
+            or _optional_str(entry.get("target"))
+            or ""
+        )
         target = _optional_str(entry.get("target")) or ""
         new_file = operation == "add"
         changes.append(_file_change_payload(
@@ -675,6 +689,25 @@ def _search_items_content(items: List[object]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_search_output(text: str) -> str:
+    path = ""
+    lines: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("Found "):
+            continue
+        if not line.startswith((" ", "\t")) and stripped.endswith(":"):
+            path = stripped[:-1]
+            continue
+        match = re.match(r"\s*Line\s+(\d+):\s?(.*)", line)
+        if path and match:
+            lines.append(f"{path}:{match.group(1)}:{match.group(2)}")
+            continue
+        if ":" in stripped:
+            lines.append(stripped)
+    return "\n".join(lines) if lines else text
+
+
 def _tool_search_result(
     *,
     tool_name: str,
@@ -692,7 +725,7 @@ def _tool_search_result(
     raw_items = cast(object, structured_dict.get("items"))
     items_value = list(cast(List[object], raw_items)) if isinstance(raw_items, list) else []
     item_count = len(items_value) if isinstance(raw_items, list) else None
-    content = _search_items_content(items_value) or _result_text(result)
+    content = _search_items_content(items_value) or _normalize_search_output(_result_text(result))
     return {
         "id": tool_call_id,
         "title": f"{normalized_tool}: {pattern}" if pattern else normalized_tool,
@@ -720,23 +753,26 @@ def _tool_read_view(
     normalized_tool = tool_name.strip().lower()
     if normalized_tool not in READ_VIEW_TOOLS:
         return None
-    page = _object_dict(structured)
+    structured_dict = _object_dict(structured)
+    display = _object_dict(structured_dict.get("display"))
+    page = display if display.get("type") == "file" else structured_dict
     if not page:
         page = _object_dict(_object_dict(result).get("value"))
     page_type = str(page.get("type") or "")
-    if page_type not in {"text-page", "text"}:
+    if page_type not in {"text-page", "text", "file"}:
         return None
-    content = page.get("content")
+    content = page.get("content") if page_type != "file" else page.get("text")
     if not isinstance(content, str):
         return None
     path = (
         _optional_str(arguments.get("path"))
+        or _optional_str(arguments.get("filePath"))
         or _optional_str(arguments.get("file_path"))
         or _optional_str(arguments.get("absolute_path"))
         or _optional_str(page.get("path"))
         or ""
     )
-    offset = _optional_int(page.get("offset")) or _optional_int(arguments.get("offset"))
+    offset = _optional_int(page.get("offset")) or _optional_int(page.get("lineStart")) or _optional_int(arguments.get("offset"))
     if offset is None and page_type == "text":
         offset = 1
     lines = [
@@ -746,11 +782,13 @@ def _tool_read_view(
         }
         for index, line in enumerate(content.splitlines())
     ] if offset is not None else None
-    view_range = _read_view_range(
+    line_end = _optional_int(page.get("lineEnd"))
+    view_range = [offset, line_end] if offset is not None and line_end is not None else _read_view_range(
         offset=offset,
         line_count=len(lines) if lines is not None else len(content.splitlines()),
     )
     view_id = f"{tool_call_id}:view" if tool_call_id else f"{turn_id}:view:{uuid.uuid4().hex}"
+    truncated = page.get("truncated") is True or structured_dict.get("truncated") is True
     return {
         "id": view_id,
         "title": _read_view_title(path, view_range),
@@ -761,8 +799,8 @@ def _tool_read_view(
         "tool": normalized_tool,
         "source_tool": tool_name,
         "tool_call_id": tool_call_id,
-        "truncated": page.get("truncated") is True,
-        "next": _optional_int(page.get("next")),
+        "truncated": truncated,
+        "next": _optional_int(page.get("next")) or (line_end + 1 if truncated and line_end is not None else None),
     }
 
 

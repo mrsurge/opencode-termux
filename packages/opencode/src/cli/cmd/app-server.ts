@@ -384,6 +384,7 @@ export type ActiveTurn = {
   readonly content: string[]
   readonly reasoning: string[]
   partLengths?: Map<string, number>
+  partTypes?: Map<string, string>
   toolStates?: Map<string, string>
   assistantMessageIds?: Set<string>
   started?: boolean
@@ -986,6 +987,7 @@ function routeTurnNotifications(activeTurns: Map<string, ActiveTurn>, event: unk
   if (!turn) return []
 
   if (type === "message.updated") return routeMessageUpdatedNotifications(turn, properties)
+  if (type === "message.part.delta") return routePartDeltaNotifications(turn, properties)
   if (type === "message.part.updated") return routePartUpdatedNotifications(turn, properties)
   if (type === "session.error") {
     return turnFailureNotifications(activeTurns, sessionId, properties.error ?? { type: "unknown", message: "Session failed." })
@@ -1000,6 +1002,9 @@ function routeTurnNotifications(activeTurns: Map<string, ActiveTurn>, event: unk
 }
 
 function routeEventSessionID(type: string | undefined, properties: Record<string, unknown>) {
+  if (type === "message.part.delta") {
+    return stringValue(properties.sessionID)
+  }
   if (type === "message.part.updated" || type === "message.part.removed") {
     return stringValue(record(properties.part).sessionID)
   }
@@ -1050,11 +1055,37 @@ function routePartUpdatedNotifications(turn: ActiveTurn, properties: Record<stri
   const messageId = stringValue(part.messageID)
   if (!messageId || !turn.assistantMessageIds?.has(messageId)) return []
   const type = stringValue(part.type)
+  const partId = stringValue(part.id)
+  if (partId && type) {
+    const partTypes = turn.partTypes ?? new Map<string, string>()
+    partTypes.set(partId, type)
+    turn.partTypes = partTypes
+  }
   if (type === "text") return routeTextPartNotifications(turn, part)
   if (type === "reasoning") return routeReasoningPartNotifications(turn, part)
   if (type === "tool") return routeToolPartNotifications(turn, part)
   if (type === "step-finish") return routeStepFinishNotifications(turn, part)
   return []
+}
+
+function routePartDeltaNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  const messageId = stringValue(properties.messageID)
+  if (!messageId || !turn.assistantMessageIds?.has(messageId)) return []
+  if (stringValue(properties.field) !== "text") return []
+  const partId = stringValue(properties.partID)
+  const delta = stringValue(properties.delta)
+  if (!partId || !delta) return []
+  const type = turn.partTypes?.get(partId)
+  if (type !== "text" && type !== "reasoning") return []
+  const lengths = turn.partLengths ?? new Map<string, number>()
+  turn.partLengths = lengths
+  lengths.set(partId, (lengths.get(partId) ?? 0) + delta.length)
+  if (type === "text") {
+    turn.content.push(delta)
+    return [notification("turn/contentDelta", { ...turnBase(turn), delta, textId: partId })]
+  }
+  turn.reasoning.push(delta)
+  return [notification("turn/thoughtDelta", { ...turnBase(turn), delta, reasoningId: partId })]
 }
 
 function routeTextPartNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
@@ -1087,10 +1118,13 @@ function routeToolPartNotifications(turn: ActiveTurn, part: Record<string, unkno
   const toolCallId = stringValue(part.callID) ?? stringValue(part.id)
   const toolStates = turn.toolStates ?? new Map<string, string>()
   turn.toolStates = toolStates
+  if (!status) return []
+  const statusKey = status === "running" ? `${status}:${JSON.stringify(state.input ?? {})}` : status
   const previous = toolStates.get(String(toolCallId))
-  if (!status || previous === status) return []
-  toolStates.set(String(toolCallId), status)
-  if (status === "pending" || status === "running") {
+  if (previous === statusKey) return []
+  toolStates.set(String(toolCallId), statusKey)
+  if (status === "pending") return []
+  if (status === "running") {
     return [
       notification("turn/toolCallRequested", {
         ...turnBase(turn),

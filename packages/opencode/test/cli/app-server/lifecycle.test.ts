@@ -1422,6 +1422,146 @@ test("app-server translates session errors into failed turn completion", () => {
   ])
 })
 
+test("app-server translates route part deltas without final snapshot duplication", () => {
+  const activeTurns = new Map<string, ActiveTurn>([
+    [
+      "ses_test",
+      {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        content: [],
+        reasoning: [],
+        assistantMessageIds: new Set(["msg_test"]),
+      },
+    ],
+  ])
+
+  const created = turnNotifications(activeTurns, {
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_test",
+      part: {
+        id: "prt_text",
+        messageID: "msg_test",
+        sessionID: "ses_test",
+        type: "text",
+        text: "",
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const streamed = turnNotifications(activeTurns, {
+    type: "message.part.delta",
+    properties: {
+      sessionID: "ses_test",
+      messageID: "msg_test",
+      partID: "prt_text",
+      field: "text",
+      delta: "hello",
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const finalized = turnNotifications(activeTurns, {
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_test",
+      part: {
+        id: "prt_text",
+        messageID: "msg_test",
+        sessionID: "ses_test",
+        type: "text",
+        text: "hello",
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+
+  expect(created).toEqual([])
+  expect(streamed).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/contentDelta",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        delta: "hello",
+        textId: "prt_text",
+      },
+    },
+  ])
+  expect(finalized).toEqual([])
+})
+
+test("app-server waits for running tool input before emitting tool requests", () => {
+  const activeTurns = new Map<string, ActiveTurn>([
+    [
+      "ses_test",
+      {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        content: [],
+        reasoning: [],
+        assistantMessageIds: new Set(["msg_test"]),
+      },
+    ],
+  ])
+
+  const pending = turnNotifications(activeTurns, {
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_test",
+      part: {
+        id: "prt_tool",
+        messageID: "msg_test",
+        sessionID: "ses_test",
+        type: "tool",
+        tool: "read",
+        callID: "call_read",
+        state: {
+          status: "pending",
+          input: {},
+        },
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const running = turnNotifications(activeTurns, {
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_test",
+      part: {
+        id: "prt_tool",
+        messageID: "msg_test",
+        sessionID: "ses_test",
+        type: "tool",
+        tool: "read",
+        callID: "call_read",
+        state: {
+          status: "running",
+          input: { filePath: "/workspace/example.txt" },
+        },
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+
+  expect(pending).toEqual([])
+  expect(running).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/toolCallRequested",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        toolCallId: "call_read",
+        messageId: "msg_test",
+        tool: "read",
+        input: { filePath: "/workspace/example.txt" },
+        raw: undefined,
+      },
+    },
+  ])
+})
+
 test("app-server handles user input response params", async () => {
   const replies: unknown[] = []
   const response = await handleLine(
