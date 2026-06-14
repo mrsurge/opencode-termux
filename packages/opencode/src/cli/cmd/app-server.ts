@@ -2,28 +2,10 @@ import { createInterface } from "node:readline"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs"
 import { EOL } from "os"
-import { Cause, DateTime, Effect, Exit, JsonSchema, ManagedRuntime, Option, Schema, Scope } from "effect"
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
-import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js"
-import { Tool, ToolFailure } from "@opencode-ai/llm"
+import { Effect } from "effect"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { effectCmd } from "../effect-cmd"
-import { AbsolutePath, Location, Model, OpenCode, Prompt, Session } from "@opencode-ai/core/public"
-import { Catalog } from "@opencode-ai/core/catalog"
-import { EventV2 } from "@opencode-ai/core/event"
-import { LocationServiceMap } from "@opencode-ai/core/location-layer"
-import { ModelV2 } from "@opencode-ai/core/model"
-import { ModelsDev } from "@opencode-ai/core/models-dev"
-import { PermissionV2 } from "@opencode-ai/core/permission"
-import { PluginBoot } from "@opencode-ai/core/plugin/boot"
-import { ProviderV2 } from "@opencode-ai/core/provider"
-import { QuestionV2 } from "@opencode-ai/core/question"
-import { SessionInstructionOverlay } from "@opencode-ai/core/session-instruction-overlay"
-import { NativeTool } from "@opencode-ai/core/tool/native"
-import { NamedError } from "@opencode-ai/core/util/error"
-import { Provider } from "../../provider/provider"
+import { Identifier } from "../../id/id"
 
 const ProtocolVersion = "0.1.0"
 
@@ -62,7 +44,7 @@ type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification
 
 type NotificationEmitter = (method: string, params: Record<string, unknown>) => void
 type NotificationCleanup = () => Promise<void>
-type LocationServices = { readonly get: typeof LocationServiceMap.get }
+type PermissionReply = "once" | "always" | "reject"
 
 type ServerInitializeResult = {
   readonly serverName: "opencode-app-server"
@@ -77,7 +59,7 @@ type ServerInitializeResult = {
     readonly providers: true
     readonly approvals: true
     readonly userInput: true
-    readonly mcp: true
+    readonly mcp: false
   }
 }
 
@@ -121,8 +103,6 @@ type ModelVariantListResult = {
   readonly data: readonly ModelVariantInfo[]
   readonly default?: string
 }
-
-type RuntimeVariantIndex = ReadonlyMap<string, Record<string, Record<string, unknown>>>
 
 type ModelVariantInfo = {
   readonly id: string
@@ -263,6 +243,29 @@ type SessionListResult = {
   readonly data: readonly SessionInfo[]
 }
 
+type SessionMessagesParams = {
+  readonly sessionId: string
+  readonly limit?: number
+  readonly order?: "asc" | "desc"
+  readonly cursor?: {
+    readonly id: string
+    readonly direction: "previous" | "next"
+  }
+}
+
+type SessionMessagesResult = {
+  readonly sessionId: string
+  readonly providerSessionId: string
+  readonly threadId: string
+  readonly data: readonly unknown[]
+  readonly messages: readonly unknown[]
+  readonly cursor?: {
+    readonly id: string
+    readonly direction: "previous"
+  }
+  readonly nextCursor?: string
+}
+
 type SessionStatusResult = SessionInfo & {
   readonly exists: true
   readonly active: false
@@ -315,7 +318,7 @@ type TurnCancelResult = {
 type ToolApprovalRespondParams = {
   readonly sessionId: string
   readonly requestId: string
-  readonly reply: PermissionV2.Reply
+  readonly reply: PermissionReply
   readonly message?: string
 }
 
@@ -326,7 +329,7 @@ type ToolApprovalRespondResult = {
   readonly threadId: string
   readonly requestId: string
   readonly approvalId: string
-  readonly reply: PermissionV2.Reply
+  readonly reply: PermissionReply
 }
 
 type UserInputRespondParams = {
@@ -364,6 +367,7 @@ type AppServerServices = {
   readonly listModelVariants: (params: ModelVariantListParams) => Promise<ModelVariantListResult>
   readonly createSession: (params: SessionCreateParams) => Promise<SessionCreateResult>
   readonly listSessions: (params: SessionListParams) => Promise<SessionListResult>
+  readonly sessionMessages?: (params: SessionMessagesParams) => Promise<SessionMessagesResult>
   readonly getSessionStatus: (params: SessionStatusParams) => Promise<SessionStatusResult>
   readonly resumeSession: (params: SessionResumeParams) => Promise<SessionResumeResult>
   readonly startTurn: (params: TurnStartParams, emit: NotificationEmitter) => Promise<TurnStartResult>
@@ -371,6 +375,7 @@ type AppServerServices = {
   readonly respondToolApproval: (params: ToolApprovalRespondParams) => Promise<ToolApprovalRespondResult>
   readonly respondUserInput: (params: UserInputRespondParams) => Promise<UserInputRespondResult>
   readonly rejectUserInput: (params: UserInputRejectParams) => Promise<UserInputRejectResult>
+  readonly dispose?: () => Promise<void>
 }
 
 export type ActiveTurn = {
@@ -378,8 +383,81 @@ export type ActiveTurn = {
   readonly sessionId: string
   readonly content: string[]
   readonly reasoning: string[]
+  partLengths?: Map<string, number>
+  toolStates?: Map<string, string>
+  assistantMessageIds?: Set<string>
+  started?: boolean
+  cancelRequested?: boolean
   readonly contextWindow?: number
   readonly cleanup?: NotificationCleanup
+}
+
+type RouteClient = ReturnType<typeof createOpencodeClient>
+
+type RouteSession = {
+  readonly id: string
+  readonly directory: string
+  readonly title: string
+  readonly model?: {
+    readonly id?: string
+    readonly modelID?: string
+    readonly providerID?: string
+    readonly variant?: string
+  }
+  readonly time: {
+    readonly created: number
+    readonly updated: number
+  }
+}
+
+type RouteProviderList = {
+  readonly all: readonly RouteProvider[]
+  readonly default?: Record<string, string>
+  readonly connected?: readonly string[]
+}
+
+type RouteConfigProviderList = {
+  readonly providers: readonly RouteProvider[]
+  readonly default?: Record<string, string>
+}
+
+type RouteProvider = {
+  readonly id: string
+  readonly name: string
+  readonly source: string
+  readonly env?: readonly string[]
+  readonly models?: Record<string, RouteModel>
+  readonly options?: Record<string, unknown>
+}
+
+type RouteModel = {
+  readonly id: string
+  readonly providerID: string
+  readonly api?: Record<string, unknown>
+  readonly name: string
+  readonly family?: string
+  readonly capabilities?: {
+    readonly reasoning?: boolean
+    readonly attachment?: boolean
+    readonly toolcall?: boolean
+    readonly input?: Record<string, boolean>
+    readonly output?: Record<string, boolean>
+    readonly interleaved?: boolean | Record<string, unknown>
+  }
+  readonly cost?: unknown
+  readonly limit?: {
+    readonly context?: number
+    readonly input?: number
+    readonly output?: number
+  }
+  readonly status?: string
+  readonly variants?: Record<string, Record<string, unknown>>
+}
+
+type RouteModelSelection = {
+  readonly providerID: string
+  readonly modelID: string
+  readonly variant?: string
 }
 
 class AppServerError extends Error {
@@ -391,627 +469,216 @@ class AppServerError extends Error {
   }
 }
 
-type McpBridgeStatus = {
-  readonly servers: Record<string, McpBridgeServerStatus>
-}
-
-type McpBridgeServerStatus =
-  | { readonly status: "connected"; readonly toolCount: number }
-  | { readonly status: "disabled" }
-  | { readonly status: "failed"; readonly error: string }
-
-type McpToolDefinition = {
-  readonly name: string
-  readonly description?: string
-  readonly inputSchema: Record<string, unknown>
-}
-
-type McpToolContent = {
-  readonly type?: unknown
-  readonly text?: unknown
-  readonly data?: unknown
-  readonly mimeType?: unknown
-}
-
-type McpConnectResult = {
-  readonly clients: readonly Client[]
-  readonly tools: Record<string, NativeTool.Any>
-  readonly status: Record<string, McpBridgeServerStatus>
-}
-
-function createMcpToolBridge() {
-  let registrationKey = ""
-  let clients: readonly Client[] = []
-  let attachmentScope: Scope.Closeable | undefined
-  let status: Record<string, McpBridgeServerStatus> = {}
-
-  const closeCurrent = Effect.fn("AppServerMcp.closeCurrent")(function* () {
-    if (attachmentScope) {
-      yield* Scope.close(attachmentScope, Exit.void)
-      attachmentScope = undefined
-    }
-    const staleClients = clients
-    clients = []
-    yield* Effect.promise(() => Promise.all(staleClients.map((client) => client.close().catch(() => undefined))))
-  })
-
-  return {
-    status: (): McpBridgeStatus => ({ servers: { ...status } }),
-    sync: Effect.fn("AppServerMcp.sync")(function* (
-      params: McpParams,
-      opencode: OpenCode.Interface,
-      cwd: string,
-    ) {
-      if (params.mcpServers === undefined) return
-      const nextKey = stableStringify(params.mcpServers)
-      if (nextKey === registrationKey) return
-
-      yield* closeCurrent()
-      registrationKey = nextKey
-      status = Object.fromEntries(
-        Object.entries(params.mcpServers)
-          .filter((entry) => entry[1].disabled === true)
-          .map(([name]) => [name, { status: "disabled" as const }]),
-      )
-
-      const active = Object.fromEntries(Object.entries(params.mcpServers).filter((entry) => entry[1].disabled !== true))
-      if (Object.keys(active).length === 0) return
-
-      const connected = yield* Effect.promise(() => connectMcpServers(active, cwd))
-      const scope = yield* Scope.make()
-      yield* opencode.tools.attach(connected.tools).pipe(Scope.provide(scope))
-      attachmentScope = scope
-      clients = connected.clients
-      status = { ...status, ...connected.status }
-    }),
-    dispose: closeCurrent,
-  }
-}
-
-async function connectMcpServers(servers: Record<string, McpServerConfig>, cwd: string): Promise<McpConnectResult> {
-  const clients: Client[] = []
-  const tools: Record<string, NativeTool.Any> = {}
-  const status: Record<string, McpBridgeServerStatus> = {}
-  try {
-    for (const [serverName, config] of Object.entries(servers)) {
-      const client = await connectMcpServer(serverName, config, cwd)
-      clients.push(client)
-      const listed = await client.listTools(undefined, { timeout: config.timeout })
-      for (const item of listed.tools) {
-        const tool = mcpToolDefinition(item)
-        tools[mcpToolName(serverName, tool.name)] = mcpApplicationTool(serverName, client, tool, config.timeout)
-      }
-      status[serverName] = { status: "connected", toolCount: listed.tools.length }
-    }
-    return { clients, tools, status }
-  } catch (error) {
-    await Promise.all(clients.map((client) => client.close().catch(() => undefined)))
-    throw error
-  }
-}
-
-async function connectMcpServer(serverName: string, config: McpServerConfig, cwd: string) {
-  const client = new Client({ name: "opencode-app-server", version: ProtocolVersion })
-  if (config.type === "remote") {
-    const url = new URL(config.url)
-    const transport =
-      config.transport === "sse"
-        ? new SSEClientTransport(url, { requestInit: config.headers ? { headers: config.headers } : undefined })
-        : new StreamableHTTPClientTransport(url, {
-            requestInit: config.headers ? { headers: config.headers } : undefined,
-          })
-    await timeoutPromise(client.connect(transport), config.timeout, `MCP server ${serverName} connection timed out`)
-    return client
-  }
-
-  const [command, ...args] = config.command
-  if (!command) throw new Error(`MCP server ${serverName} command is empty`)
-  await timeoutPromise(
-    client.connect(
-      new StdioClientTransport({
-        stderr: "pipe",
-        command,
-        args,
-        cwd: config.cwd ?? cwd,
-      env: {
-        ...processEnvironment(),
-        ...config.environment,
-      },
-      }),
-    ),
-    config.timeout,
-    `MCP server ${serverName} connection timed out`,
-  )
-  return client
-}
-
-async function timeoutPromise<T>(promise: Promise<T>, timeout: number | undefined, message: string): Promise<T> {
-  if (timeout === undefined) return promise
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeout)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
-function mcpToolDefinition(value: unknown): McpToolDefinition {
-  const tool = record(value)
-  const name = stringValue(tool.name)
-  if (!name) throw new Error("MCP tool is missing a name")
-  const inputSchema = record(tool.inputSchema)
-  if (Object.keys(inputSchema).length === 0) throw new Error(`MCP tool ${name} is missing inputSchema`)
-  return {
-    name,
-    description: stringValue(tool.description),
-    inputSchema,
-  }
-}
-
-function mcpApplicationTool(
-  serverName: string,
-  client: Client,
-  tool: McpToolDefinition,
-  timeout: number | undefined,
-) {
-  return {
-    definition: Tool.make({
-      description: tool.description ?? "",
-      jsonSchema: mcpJsonSchema(tool.inputSchema),
-      toModelOutput: ({ output }) => mcpResultContent(record(output).content),
-    }),
-    execute: (params) =>
-      Effect.tryPromise({
-        try: async () => {
-          const result = await client.callTool(
-            { name: tool.name, arguments: record(params) },
-            CallToolResultSchema,
-            { resetTimeoutOnProgress: true, timeout },
-          )
-          if (result.isError)
-            throw new Error(mcpResultText(mcpToolContentList(result.content)) || `MCP tool failed: ${serverName}/${tool.name}`)
-          return result
-        },
-        catch: (error) =>
-          new ToolFailure({
-            message: error instanceof Error ? error.message : String(error),
-            error,
-          }),
-      }),
-  } satisfies NativeTool.Any
-}
-
-function mcpJsonSchema(inputSchema: Record<string, unknown>): JsonSchema.JsonSchema {
-  return {
-    ...inputSchema,
-    type: "object",
-    properties: record(inputSchema.properties),
-  } as JsonSchema.JsonSchema
-}
-
-function mcpResultContent(value: unknown) {
-  const text = mcpResultText(mcpToolContentList(value))
-  return text ? [{ type: "text" as const, text }] : []
-}
-
-function mcpToolContentList(value: unknown) {
-  return Array.isArray(value) ? value.map((item) => record(item) as McpToolContent) : []
-}
-
-function mcpResultText(content: readonly McpToolContent[] | undefined) {
-  return (content ?? [])
-    .flatMap((item) => (item.type === "text" && typeof item.text === "string" ? [item.text] : []))
-    .join("\n")
-}
-
-function processEnvironment() {
-  return Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-  )
-}
-
-function mcpToolName(serverName: string, toolName: string) {
-  return `${sanitizeIdentifier(serverName)}_${sanitizeIdentifier(toolName)}`
-}
-
-function sanitizeIdentifier(value: string) {
-  return value.replace(/[^a-zA-Z0-9_-]/g, "_")
-}
-
-function stableStringify(value: unknown): string {
-  return JSON.stringify(stableJson(value))
-}
-
-function stableJson(value: unknown): unknown {
-  if (!value || typeof value !== "object") return value
-  if (Array.isArray(value)) return value.map(stableJson)
-  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [
-    key,
-    stableJson(item),
-  ]))
-}
-
 export const AppServerCommand = effectCmd({
   command: "app-server",
   describe: "start stdio JSON-RPC app server",
   instance: false,
   handler: Effect.fn("Cli.appServer")(function* () {
     routeConsoleToStderr()
-    const openCodeRuntime = ManagedRuntime.make(OpenCode.appServerLayer)
+    const routeClient = createRouteClient()
     const activeTurns = new Map<string, ActiveTurn>()
-    const mcpBridge = createMcpToolBridge()
+    const eventControllers = new Map<string, AbortController>()
+    const ensureEventLoop = (cwd: string, emit: NotificationEmitter) => {
+      if (eventControllers.has(cwd)) return
+      const controller = new AbortController()
+      eventControllers.set(cwd, controller)
+      void routeEventLoop(routeClient, cwd, controller.signal, activeTurns, emit)
+        .catch((cause) => {
+          if (!controller.signal.aborted) console.error(errorDetails("event.subscribe", cause).message)
+        })
+        .finally(() => {
+          if (eventControllers.get(cwd) === controller) eventControllers.delete(cwd)
+        })
+    }
+    const dispose = async () => {
+      for (const controller of eventControllers.values()) {
+        controller.abort()
+      }
+      eventControllers.clear()
+      await cleanupAllActiveTurns(activeTurns)
+    }
     yield* Effect.promise(() =>
       runAppServer({
-        listProviders: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const locations = yield* LocationServiceMap
-              const cwd = resolveCwd(params.cwd ?? process.cwd())
-              return yield* Effect.gen(function* () {
-                yield* (yield* PluginBoot.Service).wait()
-                const catalog = yield* Catalog.Service
-                const providers = (yield* catalog.provider.all()).filter(discoverableProvider)
-                const models = discoverableModels(providers, yield* catalog.model.all())
-                const defaultModel = yield* catalog.model.default()
-                return providerListResult(providers, models, defaultModel)
-              }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(cwd) }))))
-            }),
+        listProviders: async (params) =>
+          routeProviderListResult(await routeProviderCatalog(routeClient, params.cwd)),
+        listModels: async (params) =>
+          routeModelListResult(
+            await routeProviderCatalog(routeClient, params.cwd),
+            params,
           ),
-        listModels: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const locations = yield* LocationServiceMap
-              const cwd = resolveCwd(params.cwd ?? process.cwd())
-              return yield* Effect.gen(function* () {
-                yield* (yield* PluginBoot.Service).wait()
-                const catalog = yield* Catalog.Service
-                const providers = (yield* catalog.provider.all()).filter(discoverableProvider)
-                const models = discoverableModels(providers, yield* catalog.model.all())
-                const defaultModel = yield* catalog.model.default()
-                const runtimeVariants = yield* runtimeVariantIndexEffect()
-                return modelListResult(providers, models, defaultModel, params, runtimeVariants)
-              }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(cwd) }))))
-            }),
+        listModelVariants: async (params) =>
+          routeModelVariantListResult(
+            await routeProviderCatalog(routeClient, params.cwd),
+            params,
           ),
-        listModelVariants: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const locations = yield* LocationServiceMap
-              const cwd = resolveCwd(params.cwd ?? process.cwd())
-              return yield* Effect.gen(function* () {
-                yield* (yield* PluginBoot.Service).wait()
-                const catalog = yield* Catalog.Service
-                const providers = (yield* catalog.provider.all()).filter(discoverableProvider)
-                const models = discoverableModels(providers, yield* catalog.model.all())
-                const runtimeVariants = yield* runtimeVariantIndexEffect()
-                return modelVariantListResult(models, params, runtimeVariants)
-              }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(cwd) }))))
-            }),
-          ),
-        createSession: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const locations = yield* LocationServiceMap
-              const cwd = resolveCwd(params.cwd)
-              const location = Location.Ref.make({ directory: AbsolutePath.make(cwd) })
-              yield* mcpBridge.sync(params, opencode, cwd)
-              const model = modelRef(params)
-              if (model) {
-                yield* Effect.gen(function* () {
-                  yield* (yield* PluginBoot.Service).wait()
-                  const catalog = yield* Catalog.Service
-                  const catalogModel = yield* catalog.model.get(model.providerID, model.id).pipe(
-                    Effect.catch(() =>
-                      Effect.fail(new AppServerError(-32030, `Model not found: ${model.providerID}/${model.id}`)),
-                    ),
-                  )
-                  if (
-                    model.variant !== undefined &&
-                    model.variant !== "default" &&
-                    !catalogModel.variants.some((variant) => variant.id === model.variant)
-                  ) {
-                    return yield* Effect.fail(
-                      new AppServerError(
-                        -32031,
-                        `Model variant not found: ${model.providerID}/${model.id}/${model.variant}`,
-                      ),
-                    )
-                  }
-                }).pipe(Effect.provide(locations.get(location)))
-              }
-              const session = yield* opencode.sessions.create({
-                id: params.sessionId ? createSessionID(params.sessionId) : undefined,
-                location,
-                model,
-              })
-              yield* applyInstructionOverlay(
-                params,
-                session,
-                yield* instructionModelRef(locations, session.location, model),
-                locations,
+        createSession: async (params) => {
+          assertRouteSupportedParams(params)
+          const cwd = resolveCwd(params.cwd)
+          const selectedModel = routeModelSelection(params)
+          if (selectedModel) {
+            routeRequireModelSelection(await routeProviderCatalog(routeClient, cwd), selectedModel)
+          }
+          const session = params.sessionId
+            ? await routeData<RouteSession>(
+                "session.get",
+                routeClient.session.get({ sessionID: params.sessionId, directory: cwd }),
+                { notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`) },
               )
-              return sessionCreateResult(session, params)
+            : await routeData<RouteSession>(
+                "session.create",
+                routeClient.session.create({
+                  directory: cwd,
+                  model: routeCreateModel(selectedModel),
+                }),
+              )
+          return routeSessionCreateResult(session)
+        },
+        listSessions: async (params) => {
+          if (params.order !== undefined && params.order !== "desc") {
+            throw new AppServerError(-32602, "session/list only supports desc order through the HTTP route.")
+          }
+          const sessions = await routeData<readonly RouteSession[]>(
+            "session.list",
+            routeClient.session.list({
+              ...routeDirectory(params.cwd),
+              ...(params.limit ? { limit: params.limit } : {}),
+            }),
+          )
+          return { data: sessions.map(routeSessionInfo) }
+        },
+        sessionMessages: (params) =>
+          routeSessionMessages(routeClient, params),
+        getSessionStatus: async (params) =>
+          routeSessionStatusResult(
+            await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+              notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
             }),
           ),
-        listSessions: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const sessions = yield* opencode.sessions.list({
-                ...(params.cwd ? { directory: AbsolutePath.make(resolveCwd(params.cwd)) } : {}),
-                ...(params.limit ? { limit: params.limit } : {}),
-                ...(params.order ? { order: params.order } : {}),
-              })
-              return { data: sessions.map((session) => sessionInfo(session)) }
+        resumeSession: async (params) => {
+          assertRouteSupportedParams(params)
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          return routeSessionResumeResult(session)
+        },
+        startTurn: async (params, emit) => {
+          assertRouteSupportedParams(params)
+          if (params.delivery === "queue") {
+            throw new AppServerError(-32602, "turn/start delivery=queue is not supported by the HTTP route.")
+          }
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          if (activeTurns.has(session.id)) {
+            throw new AppServerError(-32020, `Session already has an active turn: ${session.id}`)
+          }
+          ensureEventLoop(session.directory, emit)
+          const turnId = params.turnId ?? randomUUID()
+          const selectedModel = routeModelSelection(params) ?? routeSessionModelSelection(session)
+          const providerCatalog = selectedModel ? await routeProviderCatalog(routeClient, session.directory) : undefined
+          if (selectedModel && providerCatalog) routeRequireModelSelection(providerCatalog, selectedModel)
+          const active: ActiveTurn = {
+            turnId,
+            sessionId: session.id,
+            content: [],
+            reasoning: [],
+            partLengths: new Map(),
+            toolStates: new Map(),
+            assistantMessageIds: new Set(),
+            started: false,
+            ...(selectedModel && providerCatalog
+              ? { contextWindow: routeModelContextWindow(providerCatalog, selectedModel) }
+              : {}),
+          }
+          activeTurns.set(session.id, active)
+          try {
+            const system = routeSystemPrompt(params, selectedModel)
+            const messageId = params.messageId ?? Identifier.ascending("message")
+            await routeVoid(
+              "session.prompt_async",
+              routeClient.session.promptAsync({
+                sessionID: session.id,
+                directory: session.directory,
+                messageID: messageId,
+                ...(selectedModel ? { model: { providerID: selectedModel.providerID, modelID: selectedModel.modelID } } : {}),
+                ...(selectedModel?.variant ? { variant: selectedModel.variant } : {}),
+                ...(system ? { system } : {}),
+                parts: [{ type: "text", text: params.prompt }],
+              }),
+              { notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`) },
+            )
+            return {
+              accepted: true,
+              turnId,
+              sessionId: session.id,
+              providerSessionId: session.id,
+              threadId: session.id,
+              messageId,
+              delivery: "steer",
+            }
+          } catch (cause) {
+            await cleanupActiveTurn(activeTurns, session.id)
+            throw cause
+          }
+        },
+        cancelTurn: async (params) => {
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          const active = activeTurns.get(session.id)
+          if (params.turnId && active && params.turnId !== active.turnId) {
+            throw new AppServerError(-32020, `Session has a different active turn: ${session.id}`)
+          }
+          if (active) active.cancelRequested = true
+          await routeData("session.abort", routeClient.session.abort({ sessionID: session.id, directory: session.directory }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          return routeTurnCancelResult(session, active)
+        },
+        respondToolApproval: async (params) => {
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          await routeData(
+            "permission.reply",
+            routeClient.permission.reply({
+              requestID: params.requestId,
+              directory: session.directory,
+              reply: params.reply,
+              message: params.message,
             }),
-          ),
-        getSessionStatus: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const session = yield* opencode.sessions.get(loadedSessionID(params.sessionId)).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              return sessionStatusResult(session)
+            { notFound: new AppServerError(-32040, `Permission request not found: ${params.requestId}`) },
+          )
+          return routeToolApprovalRespondResult(session, params)
+        },
+        respondUserInput: async (params) => {
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          await routeData(
+            "question.reply",
+            routeClient.question.reply({
+              requestID: params.requestId,
+              directory: session.directory,
+              answers: params.answers.map((answer) => [...answer]),
             }),
-          ),
-        resumeSession: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const locations = yield* LocationServiceMap
-              const id = loadedSessionID(params.sessionId)
-              const session = yield* opencode.sessions.get(id).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              yield* mcpBridge.sync(params, opencode, session.location.directory)
-              const model = modelRef(params)
-              if (model) {
-                yield* opencode.sessions.switchModel({ sessionID: id, model }).pipe(
-                  Effect.catchTag("Session.NotFoundError", () =>
-                    Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                  ),
-                  Effect.catchTag("Session.ModelUnavailableError", (error) =>
-                    Effect.fail(new AppServerError(-32030, `Model not found: ${error.providerID}/${error.modelID}`)),
-                  ),
-                  Effect.catchTag("Session.VariantUnavailableError", (error) =>
-                    Effect.fail(
-                      new AppServerError(
-                        -32031,
-                        `Model variant not found: ${error.providerID}/${error.modelID}/${error.variant}`,
-                      ),
-                    ),
-                  ),
-                )
-              }
-              yield* applyInstructionOverlay(
-                params,
-                session,
-                yield* instructionModelRef(locations, session.location, model ?? session.model),
-                locations,
-              )
-              yield* opencode.sessions.resume(session.id)
-              return sessionResumeResult(session)
-            }),
-          ),
-        startTurn: (params, emit) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const locations = yield* LocationServiceMap
-              const id = loadedSessionID(params.sessionId)
-              const session = yield* opencode.sessions.get(id).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              yield* mcpBridge.sync(params, opencode, session.location.directory)
-              if (activeTurns.has(session.id)) {
-                return yield* Effect.fail(new AppServerError(-32020, `Session already has an active turn: ${session.id}`))
-              }
-              const requestedModel = modelRef(params)
-              if (requestedModel) {
-                yield* opencode.sessions.switchModel({ sessionID: id, model: requestedModel }).pipe(
-                  Effect.catchTag("Session.NotFoundError", () =>
-                    Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                  ),
-                  Effect.catchTag("Session.ModelUnavailableError", (error) =>
-                    Effect.fail(new AppServerError(-32030, `Model not found: ${error.providerID}/${error.modelID}`)),
-                  ),
-                  Effect.catchTag("Session.VariantUnavailableError", (error) =>
-                    Effect.fail(
-                      new AppServerError(
-                        -32031,
-                        `Model variant not found: ${error.providerID}/${error.modelID}/${error.variant}`,
-                      ),
-                    ),
-                  ),
-                )
-              }
-              const turnId = params.turnId ?? randomUUID()
-              const selectedModel = requestedModel ?? session.model
-              yield* applyInstructionOverlay(
-                params,
-                session,
-                yield* instructionModelRef(locations, session.location, selectedModel),
-                locations,
-              )
-              const contextWindow =
-                selectedModel === undefined
-                  ? undefined
-                  : yield* Effect.gen(function* () {
-                      yield* (yield* PluginBoot.Service).wait()
-                      const catalog = yield* Catalog.Service
-                      return positiveNumber((yield* catalog.model.get(selectedModel.providerID, selectedModel.id)).limit.context)
-                    }).pipe(Effect.provide(locations.get(session.location)), Effect.catch(() => Effect.succeed(undefined)))
-              const unsubscribe = yield* Effect.gen(function* () {
-                const events = yield* EventV2.Service
-                return yield* events.listen((event) =>
-                  Effect.sync(() => {
-                    for (const item of turnNotifications(activeTurns, event)) {
-                      emit(item.method, item.params)
-                    }
-                  }),
-                )
-              }).pipe(Effect.provide(locations.get(session.location)))
-              activeTurns.set(session.id, {
-                turnId,
-                sessionId: session.id,
-                content: [],
-                reasoning: [],
-                ...(contextWindow === undefined ? {} : { contextWindow }),
-                cleanup: () => Effect.runPromise(unsubscribe),
-              })
-              const admission = yield* opencode.sessions
-                .prompt({
-                  ...(params.messageId ? { id: Session.MessageID.make(params.messageId) } : {}),
-                  sessionID: id,
-                  prompt: Prompt.fromUserMessage({ text: params.prompt }),
-                  delivery: params.delivery,
-                })
-                .pipe(Effect.tapError(() => Effect.promise(() => cleanupActiveTurn(activeTurns, session.id))))
-              yield* opencode.sessions
-                .resume(session.id)
-                .pipe(
-                  Effect.catchCause((cause: Cause.Cause<unknown>) =>
-                    Effect.sync(() => {
-                      for (const item of turnFailureNotifications(activeTurns, session.id, causeError(cause))) {
-                        emit(item.method, item.params)
-                      }
-                    }),
-                  ),
-                  Effect.forkDetach,
-                )
-              return {
-                accepted: true,
-                turnId,
-                sessionId: session.id,
-                providerSessionId: session.id,
-                threadId: session.id,
-                messageId: admission.id,
-                delivery: admission.delivery,
-              }
-            }),
-          ),
-        cancelTurn: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const id = loadedSessionID(params.sessionId)
-              const session = yield* opencode.sessions.get(id).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              const active = activeTurns.get(session.id)
-              if (params.turnId && active && params.turnId !== active.turnId) {
-                return yield* Effect.fail(
-                  new AppServerError(-32020, `Session has a different active turn: ${session.id}`),
-                )
-              }
-              yield* opencode.sessions.interrupt(session.id)
-              return turnCancelResult(session, active)
-            }),
-          ),
-        respondToolApproval: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const locations = yield* LocationServiceMap
-              const id = loadedSessionID(params.sessionId)
-              const session = yield* opencode.sessions.get(id).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              yield* Effect.gen(function* () {
-                const permission = yield* PermissionV2.Service
-                yield* permission
-                  .reply({
-                    requestID: PermissionV2.ID.make(params.requestId),
-                    reply: params.reply,
-                    message: params.message,
-                  })
-                  .pipe(
-                    Effect.catchTag("PermissionV2.NotFoundError", () =>
-                      Effect.fail(new AppServerError(-32040, `Permission request not found: ${params.requestId}`)),
-                    ),
-                  )
-              }).pipe(Effect.provide(locations.get(session.location)))
-              return toolApprovalRespondResult(session, params)
-            }),
-          ),
-        respondUserInput: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const locations = yield* LocationServiceMap
-              const id = loadedSessionID(params.sessionId)
-              const session = yield* opencode.sessions.get(id).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              yield* Effect.gen(function* () {
-                const questions = yield* QuestionV2.Service
-                yield* questions
-                  .reply({
-                    requestID: questionRequestID(params.requestId),
-                    answers: params.answers,
-                  })
-                  .pipe(
-                    Effect.catchTag("QuestionV2.NotFoundError", () =>
-                      Effect.fail(new AppServerError(-32050, `Question request not found: ${params.requestId}`)),
-                    ),
-                  )
-              }).pipe(Effect.provide(locations.get(session.location)))
-              return userInputRespondResult(session, params)
-            }),
-          ),
-        rejectUserInput: (params) =>
-          openCodeRuntime.runPromise(
-            Effect.gen(function* () {
-              const opencode = yield* OpenCode.Service
-              const locations = yield* LocationServiceMap
-              const id = loadedSessionID(params.sessionId)
-              const session = yield* opencode.sessions.get(id).pipe(
-                Effect.catchTag(
-                  "Session.NotFoundError",
-                  () => Effect.fail(new AppServerError(-32010, `Session not found: ${params.sessionId}`)),
-                ),
-              )
-              yield* Effect.gen(function* () {
-                const questions = yield* QuestionV2.Service
-                yield* questions.reject(questionRequestID(params.requestId)).pipe(
-                  Effect.catchTag("QuestionV2.NotFoundError", () =>
-                    Effect.fail(new AppServerError(-32050, `Question request not found: ${params.requestId}`)),
-                  ),
-                )
-              }).pipe(Effect.provide(locations.get(session.location)))
-              return userInputRejectResult(session, params)
-            }),
-          ),
+            { notFound: new AppServerError(-32050, `Question request not found: ${params.requestId}`) },
+          )
+          return routeUserInputRespondResult(session, params)
+        },
+        rejectUserInput: async (params) => {
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          await routeData(
+            "question.reject",
+            routeClient.question.reject({ requestID: params.requestId, directory: session.directory }),
+            { notFound: new AppServerError(-32050, `Question request not found: ${params.requestId}`) },
+          )
+          return routeUserInputRejectResult(session, params)
+        },
+        dispose,
       }),
-    ).pipe(
-      Effect.ensuring(
-        mcpBridge.dispose().pipe(Effect.andThen(Effect.promise(() => openCodeRuntime.dispose()).pipe(Effect.ignore))),
-      ),
     )
   }),
 })
@@ -1020,6 +687,679 @@ function routeConsoleToStderr() {
   console.log = (...input) => console.error(...input)
   console.info = (...input) => console.error(...input)
   console.debug = (...input) => console.error(...input)
+}
+
+function createRouteClient() {
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const { Server } = await import("../../server/server")
+    return Server.Default().app.fetch(new Request(input, init))
+  }) as typeof globalThis.fetch
+  return createOpencodeClient({
+    baseUrl: "http://opencode.internal",
+    fetch: fetchFn,
+  })
+}
+
+function routeDirectory(cwd: string | undefined) {
+  return cwd ? { directory: resolveCwd(cwd) } : {}
+}
+
+async function routeData<T>(
+  method: string,
+  promise: Promise<unknown>,
+  options?: { readonly notFound?: AppServerError },
+): Promise<T> {
+  const response = record(await promise)
+  if (response.error !== undefined) throw routeError(method, response.error, options)
+  if (!("data" in response)) throw new AppServerError(-32603, `${method} returned no data.`)
+  return response.data as T
+}
+
+async function routeVoid(
+  method: string,
+  promise: Promise<unknown>,
+  options?: { readonly notFound?: AppServerError },
+): Promise<void> {
+  const response = record(await promise)
+  if (response.error !== undefined) throw routeError(method, response.error, options)
+}
+
+function routeError(method: string, value: unknown, options: { readonly notFound?: AppServerError } | undefined) {
+  const error = record(value)
+  const tag = stringValue(error._tag) ?? stringValue(error.name)
+  const data = record(error.data)
+  const message = stringValue(error.message) ?? stringValue(data.message) ?? `${method} failed.`
+  if (options?.notFound && (tag?.includes("NotFound") || message.toLowerCase().includes("not found"))) {
+    return options.notFound
+  }
+  if (tag === "BadRequest" || tag === "InvalidRequestError") return new AppServerError(-32602, message)
+  return new AppServerError(-32603, `${method} failed: ${message}`)
+}
+
+function assertRouteSupportedParams(params: McpParams) {
+  if (params.mcpServers !== undefined) {
+    throw new AppServerError(-32602, "mcpServers are not supported by the HTTP route-backed app-server yet.")
+  }
+}
+
+async function routeProviderCatalog(client: RouteClient, cwd: string | undefined): Promise<RouteProviderList> {
+  const directory = routeDirectory(cwd)
+  const source = await routeData<RouteProviderList>("provider.list", client.provider.list(directory))
+  const configured = await routeData<RouteConfigProviderList>("config.providers", client.config.providers(directory))
+  return routeMergeProviderCatalog(source, configured)
+}
+
+function routeMergeProviderCatalog(source: RouteProviderList, configured: RouteConfigProviderList): RouteProviderList {
+  const configuredIds = new Set(configured.providers.map((provider) => provider.id))
+  const all = [
+    ...source.all.filter((provider) => !configuredIds.has(provider.id)),
+    ...configured.providers,
+  ]
+  const defaults = { ...(source.default ?? {}), ...(configured.default ?? {}) }
+  return {
+    all,
+    ...(Object.keys(defaults).length ? { default: defaults } : {}),
+    ...(source.connected ? { connected: source.connected } : {}),
+  }
+}
+
+function routeProviderListResult(source: RouteProviderList): ProviderListResult {
+  const defaultProvider = Object.keys(source.default ?? {})[0]
+  return {
+    data: source.all
+      .map((provider) => routeProviderInfo(provider, source.default?.[provider.id]))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    ...(defaultProvider ? { default: defaultProvider } : {}),
+  }
+}
+
+function routeProviderInfo(provider: RouteProvider, defaultModel: string | undefined): ProviderInfo {
+  return {
+    id: provider.id,
+    value: provider.id,
+    name: provider.name,
+    label: provider.name,
+    displayName: provider.name,
+    ...(defaultModel ? { defaultModel } : {}),
+    source: provider.source,
+    capabilities: {
+      source: provider.source,
+      modelCount: Object.keys(provider.models ?? {}).length,
+      env: provider.env ?? [],
+      options: provider.options ?? {},
+    },
+  }
+}
+
+function routeModelListResult(source: RouteProviderList, params: ModelListParams): ModelListResult {
+  return {
+    data: source.all
+      .flatMap((provider) =>
+        Object.values(provider.models ?? {})
+          .filter((model) => !params.provider || model.providerID === params.provider)
+          .map((model) => routeModelInfo(provider, model)),
+      )
+      .sort((a, b) => a.id.localeCompare(b.id)),
+    ...(params.provider && source.default?.[params.provider] ? { default: `${params.provider}/${source.default[params.provider]}` } : {}),
+  }
+}
+
+function routeModelVariantListResult(source: RouteProviderList, params: ModelVariantListParams): ModelVariantListResult {
+  const selected = modelSelection(params.provider, params.model)
+  const model = source.all
+    .flatMap((provider) => Object.values(provider.models ?? {}))
+    .find(
+      (item) =>
+        (!selected.providerID || item.providerID === selected.providerID) &&
+        (!selected.modelID || item.id === selected.modelID) &&
+        (selected.providerID !== undefined || selected.modelID !== undefined),
+    )
+  const variants = model ? routeModelVariants(model) : []
+  return {
+    data: variants,
+    default: variants[0]?.value ?? "",
+  }
+}
+
+function routeModelInfo(provider: RouteProvider, model: RouteModel): ModelInfo {
+  const variants = routeModelVariants(model)
+  const input = model.capabilities?.input ?? {}
+  const output = model.capabilities?.output ?? {}
+  const inputModalities = Object.entries(input)
+    .filter((entry) => entry[1])
+    .map((entry) => entry[0])
+  const outputModalities = Object.entries(output)
+    .filter((entry) => entry[1])
+    .map((entry) => entry[0])
+  const thinking = variants.length > 0 || model.capabilities?.reasoning === true
+  return {
+    id: `${model.providerID}/${model.id}`,
+    value: `${model.providerID}/${model.id}`,
+    provider: model.providerID,
+    providerID: model.providerID,
+    model: model.id,
+    modelID: model.id,
+    name: model.name,
+    label: `${model.name} (${provider.name})`,
+    displayName: model.name,
+    family: model.family ?? model.providerID,
+    supported_reasoning_efforts: variants,
+    supportedReasoningEfforts: variants,
+    default_reasoning_effort: variants[0]?.value ?? "",
+    defaultReasoningEffort: variants[0]?.value ?? "",
+    features: {
+      thinking,
+      multimodalToolUse: inputModalities.some((item) => item !== "text"),
+    },
+    capabilities: {
+      providerID: model.providerID,
+      modelID: model.id,
+      status: model.status,
+      context: model.limit?.context,
+      input: model.limit?.input,
+      output: model.limit?.output,
+      tools: model.capabilities?.toolcall,
+      modalities: inputModalities,
+      outputModalities,
+      reasoning: thinking,
+      api: model.api ?? {},
+      variants: variants.map((variant) => variant.id),
+      cost: model.cost,
+    },
+  }
+}
+
+function routeModelVariants(model: RouteModel): ModelVariantInfo[] {
+  return Object.entries(model.variants ?? {}).map((entry) => runtimeVariantInfo(entry[0], entry[1]))
+}
+
+function routeModelSelection(params: ModelSelectionParams): RouteModelSelection | undefined {
+  if (!params.model) return undefined
+  const providerID = params.provider ?? params.model.split("/")[0]
+  const modelID =
+    params.provider && params.model.startsWith(`${params.provider}/`)
+      ? params.model.slice(params.provider.length + 1)
+      : params.provider
+        ? params.model
+        : params.model.slice(providerID.length + 1)
+  if (!providerID || !modelID) throw new AppServerError(-32602, "Invalid session model selection.")
+  const variant = stringValue(params.variant) ?? stringValue(params.reasoningEffort)
+  return {
+    providerID,
+    modelID,
+    ...(variant && variant !== "default" ? { variant } : {}),
+  }
+}
+
+function routeCreateModel(selected: RouteModelSelection | undefined) {
+  if (!selected) return undefined
+  return {
+    providerID: selected.providerID,
+    id: selected.modelID,
+    ...(selected.variant ? { variant: selected.variant } : {}),
+  }
+}
+
+function routeRequireModelSelection(source: RouteProviderList, selected: RouteModelSelection) {
+  const model = routeFindModel(source, selected)
+  if (!model) throw new AppServerError(-32030, `Model not found: ${selected.providerID}/${selected.modelID}`)
+  if (selected.variant && !Object.hasOwn(model.variants ?? {}, selected.variant)) {
+    throw new AppServerError(-32031, `Model variant not found: ${selected.providerID}/${selected.modelID}/${selected.variant}`)
+  }
+}
+
+function routeFindModel(source: RouteProviderList, selected: RouteModelSelection) {
+  return source.all
+    .flatMap((provider) => Object.values(provider.models ?? {}))
+    .find((item) => item.providerID === selected.providerID && item.id === selected.modelID)
+}
+
+function routeSessionModelSelection(session: RouteSession): RouteModelSelection | undefined {
+  if (!session.model?.providerID) return undefined
+  const modelID = session.model.id ?? session.model.modelID
+  if (!modelID) return undefined
+  return {
+    providerID: session.model.providerID,
+    modelID,
+    ...(session.model.variant ? { variant: session.model.variant } : {}),
+  }
+}
+
+function routeModelContextWindow(source: RouteProviderList, selected: RouteModelSelection) {
+  return positiveNumber(routeFindModel(source, selected)?.limit?.context)
+}
+
+function routeSystemPrompt(params: InstructionParams, selected: RouteModelSelection | undefined) {
+  const sections = [
+    ...(params.builtinInstructions === "none" ? [] : [appServerBuiltinPrompt(selected, params.hostPlatform)]),
+    ...params.developerInstructions.map((entry) => entry.text),
+    ...params.userDeveloperInstructions.map((entry) => entry.text),
+  ].filter((item) => item.trim() !== "")
+  return sections.length ? sections.join("\n\n") : undefined
+}
+
+async function routeEventLoop(
+  client: RouteClient,
+  cwd: string,
+  signal: AbortSignal,
+  activeTurns: Map<string, ActiveTurn>,
+  emit: NotificationEmitter,
+) {
+  const events = await client.event.subscribe(
+    { directory: cwd },
+    {
+      signal,
+      sseMaxRetryAttempts: 0,
+    },
+  )
+  for await (const event of events.stream) {
+    emit("opencode/event", routeEventEnvelope(cwd, event))
+    for (const item of routeTurnNotifications(activeTurns, event)) {
+      emit(item.method, item.params)
+    }
+  }
+}
+
+function routeEventEnvelope(cwd: string, event: unknown) {
+  const item = record(event)
+  const properties = record(item.properties)
+  return {
+    id: stringValue(item.id),
+    type: stringValue(item.type),
+    sessionID: routeEventSessionID(stringValue(item.type), properties),
+    directory: cwd,
+    properties,
+  }
+}
+
+export function turnNotifications(activeTurns: Map<string, ActiveTurn>, event: unknown): JsonRpcNotification[] {
+  return routeTurnNotifications(activeTurns, event)
+}
+
+function routeTurnNotifications(activeTurns: Map<string, ActiveTurn>, event: unknown): JsonRpcNotification[] {
+  const item = record(event)
+  const type = stringValue(item.type)
+  const properties = record(item.properties)
+  const sessionId = routeEventSessionID(type, properties)
+  if (!type || !sessionId) return []
+  const turn = activeTurns.get(sessionId)
+  if (!turn) return []
+
+  if (type === "message.updated") return routeMessageUpdatedNotifications(turn, properties)
+  if (type === "message.part.updated") return routePartUpdatedNotifications(turn, properties)
+  if (type === "session.error") {
+    return turnFailureNotifications(activeTurns, sessionId, properties.error ?? { type: "unknown", message: "Session failed." })
+  }
+  if (type === "session.status") return routeSessionStatusNotifications(activeTurns, sessionId, properties)
+  if (type === "permission.asked") return routePermissionAskedNotifications(turn, properties)
+  if (type === "permission.replied") return routePermissionRepliedNotifications(turn, properties)
+  if (type === "question.asked") return routeQuestionAskedNotifications(turn, properties)
+  if (type === "question.replied") return routeQuestionResolvedNotifications(turn, properties, "answered")
+  if (type === "question.rejected") return routeQuestionResolvedNotifications(turn, properties, "rejected")
+  return []
+}
+
+function routeEventSessionID(type: string | undefined, properties: Record<string, unknown>) {
+  if (type === "message.part.updated" || type === "message.part.removed") {
+    return stringValue(record(properties.part).sessionID)
+  }
+  if (type === "message.updated" || type === "message.removed") {
+    return stringValue(record(properties.info).sessionID)
+  }
+  if (type === "permission.asked" || type === "question.asked") {
+    return stringValue(properties.sessionID)
+  }
+  if (type === "permission.replied" || type === "question.replied" || type === "question.rejected") {
+    return stringValue(properties.sessionID)
+  }
+  return stringValue(properties.sessionID)
+}
+
+function routeMessageUpdatedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  const info = record(properties.info)
+  if (stringValue(info.role) !== "assistant") return []
+  const messageId = stringValue(info.id)
+  if (messageId) {
+    const assistantMessageIds = turn.assistantMessageIds ?? new Set<string>()
+    assistantMessageIds.add(messageId)
+    turn.assistantMessageIds = assistantMessageIds
+  }
+  if (turn.started) return []
+  turn.started = true
+  return [
+    notification("turn/started", {
+      ...turnBase(turn),
+      messageId,
+    }),
+    notification("turn/modelInfo", {
+      ...turnBase(turn),
+      model: modelPayload(
+        {
+          providerID: stringValue(info.providerID),
+          id: stringValue(info.modelID),
+          variant: stringValue(info.variant),
+        },
+        turn.contextWindow,
+      ),
+    }),
+  ]
+}
+
+function routePartUpdatedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  const part = record(properties.part)
+  const messageId = stringValue(part.messageID)
+  if (!messageId || !turn.assistantMessageIds?.has(messageId)) return []
+  const type = stringValue(part.type)
+  if (type === "text") return routeTextPartNotifications(turn, part)
+  if (type === "reasoning") return routeReasoningPartNotifications(turn, part)
+  if (type === "tool") return routeToolPartNotifications(turn, part)
+  if (type === "step-finish") return routeStepFinishNotifications(turn, part)
+  return []
+}
+
+function routeTextPartNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
+  const text = stringValue(part.text) ?? ""
+  const lengths = turn.partLengths ?? new Map<string, number>()
+  turn.partLengths = lengths
+  const previous = lengths.get(String(part.id)) ?? 0
+  if (text.length <= previous) return []
+  lengths.set(String(part.id), text.length)
+  const delta = text.slice(previous)
+  turn.content.push(delta)
+  return [notification("turn/contentDelta", { ...turnBase(turn), delta, textId: stringValue(part.id) })]
+}
+
+function routeReasoningPartNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
+  const text = stringValue(part.text) ?? ""
+  const lengths = turn.partLengths ?? new Map<string, number>()
+  turn.partLengths = lengths
+  const previous = lengths.get(String(part.id)) ?? 0
+  if (text.length <= previous) return []
+  lengths.set(String(part.id), text.length)
+  const delta = text.slice(previous)
+  turn.reasoning.push(delta)
+  return [notification("turn/thoughtDelta", { ...turnBase(turn), delta, reasoningId: stringValue(part.id) })]
+}
+
+function routeToolPartNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
+  const state = record(part.state)
+  const status = stringValue(state.status)
+  const toolCallId = stringValue(part.callID) ?? stringValue(part.id)
+  const toolStates = turn.toolStates ?? new Map<string, string>()
+  turn.toolStates = toolStates
+  const previous = toolStates.get(String(toolCallId))
+  if (!status || previous === status) return []
+  toolStates.set(String(toolCallId), status)
+  if (status === "pending" || status === "running") {
+    return [
+      notification("turn/toolCallRequested", {
+        ...turnBase(turn),
+        toolCallId,
+        messageId: stringValue(part.messageID),
+        tool: stringValue(part.tool),
+        input: state.input,
+        raw: stringValue(state.raw),
+      }),
+    ]
+  }
+  if (status === "completed") {
+    return [
+      notification("turn/toolCallCompleted", {
+        ...turnBase(turn),
+        status: "completed",
+        toolCallId,
+        messageId: stringValue(part.messageID),
+        structured: state.metadata,
+        content: stringValue(state.output),
+        result: state.output,
+        title: stringValue(state.title),
+      }),
+    ]
+  }
+  if (status === "error") {
+    return [
+      notification("turn/toolCallCompleted", {
+        ...turnBase(turn),
+        status: "failed",
+        toolCallId,
+        messageId: stringValue(part.messageID),
+        error: stringValue(state.error),
+        result: stringValue(state.error),
+      }),
+    ]
+  }
+  return []
+}
+
+function routeStepFinishNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
+  const usage = tokenUsage(part.tokens, turn.contextWindow)
+  return [
+    notification("turn/usage", {
+      ...turnBase(turn),
+      tokens: part.tokens,
+      ...(usage ? { usage } : {}),
+      ...(turn.contextWindow === undefined
+        ? {}
+        : {
+            contextWindow: turn.contextWindow,
+            context_window: turn.contextWindow,
+          }),
+    }),
+  ]
+}
+
+function routeSessionStatusNotifications(
+  activeTurns: Map<string, ActiveTurn>,
+  sessionId: string,
+  properties: Record<string, unknown>,
+): JsonRpcNotification[] {
+  const status = record(properties.status)
+  if (stringValue(status.type) !== "idle") return []
+  const turn = activeTurns.get(sessionId)
+  if (!turn) return []
+  void cleanupActiveTurn(activeTurns, sessionId)
+  return [
+    notification("turn/completed", {
+      ...turnBase(turn),
+      status: turn.cancelRequested ? "cancelled" : "completed",
+      content: turn.content.join(""),
+      reasoning: turn.reasoning.join(""),
+    }),
+  ]
+}
+
+function routePermissionAskedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  const tool = record(properties.tool)
+  return [
+    notification("turn/toolApprovalRequested", {
+      ...turnBase(turn),
+      approvalId: stringValue(properties.id),
+      requestId: stringValue(properties.id),
+      permission: stringValue(properties.permission),
+      action: stringValue(properties.permission),
+      resources: stringArrayValue(properties.patterns),
+      save: stringArrayValue(properties.always),
+      metadata: record(properties.metadata),
+      source: properties.tool,
+      toolCallId: stringValue(tool.callID),
+      messageId: stringValue(tool.messageID),
+      options: ["once", "always", "reject"],
+    }),
+  ]
+}
+
+function routePermissionRepliedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  return [
+    notification("turn/toolApprovalResolved", {
+      ...turnBase(turn),
+      approvalId: stringValue(properties.requestID),
+      requestId: stringValue(properties.requestID),
+      reply: stringValue(properties.reply),
+    }),
+  ]
+}
+
+function routeQuestionAskedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  const tool = record(properties.tool)
+  return [
+    notification("turn/userInputRequested", {
+      ...turnBase(turn),
+      requestId: stringValue(properties.id),
+      questionId: stringValue(properties.id),
+      questions: properties.questions,
+      tool: properties.tool,
+      toolCallId: stringValue(tool.callID),
+      messageId: stringValue(tool.messageID),
+    }),
+  ]
+}
+
+function routeQuestionResolvedNotifications(
+  turn: ActiveTurn,
+  properties: Record<string, unknown>,
+  status: "answered" | "rejected",
+): JsonRpcNotification[] {
+  return [
+    notification("turn/userInputResolved", {
+      ...turnBase(turn),
+      requestId: stringValue(properties.requestID),
+      questionId: stringValue(properties.requestID),
+      status,
+      answers: properties.answers,
+    }),
+  ]
+}
+
+async function routeSessionMessages(client: RouteClient, params: SessionMessagesParams): Promise<SessionMessagesResult> {
+  if (params.order !== undefined && params.order !== "desc") {
+    throw new AppServerError(-32602, "session/messages only supports desc order through the HTTP route.")
+  }
+  if (params.cursor?.direction === "next") {
+    throw new AppServerError(-32602, "session/messages cursor direction next is not supported by the HTTP route.")
+  }
+  const session = await routeData<RouteSession>("session.get", client.session.get({ sessionID: params.sessionId }), {
+    notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+  })
+  const response = record(
+    await client.session.messages({
+      sessionID: session.id,
+      directory: session.directory,
+      ...(params.limit ? { limit: params.limit } : {}),
+      ...(params.cursor ? { before: params.cursor.id } : {}),
+    }),
+  )
+  if (response.error !== undefined) {
+    throw routeError("session.messages", response.error, {
+      notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+    })
+  }
+  if (!("data" in response)) throw new AppServerError(-32603, "session.messages returned no data.")
+  const messages = Array.isArray(response.data) ? response.data : []
+  const httpResponse = response.response instanceof Response ? response.response : undefined
+  const nextCursor = httpResponse?.headers.get("x-next-cursor") ?? undefined
+  return {
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    data: messages,
+    messages,
+    ...(nextCursor ? { cursor: { id: nextCursor, direction: "previous" }, nextCursor } : {}),
+  }
+}
+
+function routeSessionCreateResult(session: RouteSession): SessionCreateResult {
+  return routeSessionInfo(session)
+}
+
+function routeSessionStatusResult(session: RouteSession): SessionStatusResult {
+  return {
+    ...routeSessionInfo(session),
+    exists: true,
+    active: false,
+    busy: false,
+    pending: false,
+    status: "idle",
+  }
+}
+
+function routeSessionResumeResult(session: RouteSession): SessionResumeResult {
+  return {
+    resumed: true,
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+  }
+}
+
+function routeSessionInfo(session: RouteSession): SessionInfo {
+  return {
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    cwd: session.directory,
+    ...routeSessionModelFields(session),
+    title: session.title,
+    createdAt: new Date(session.time.created).toISOString(),
+    updatedAt: new Date(session.time.updated).toISOString(),
+  }
+}
+
+function routeSessionModelFields(session: RouteSession) {
+  const selected = routeSessionModelSelection(session)
+  if (!selected) return {}
+  return {
+    provider: selected.providerID,
+    model: selected.modelID,
+    ...(selected.variant ? { variant: selected.variant } : {}),
+  }
+}
+
+function routeTurnCancelResult(session: RouteSession, active: ActiveTurn | undefined): TurnCancelResult {
+  return {
+    cancelled: true,
+    active: active !== undefined,
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    ...(active ? { turnId: active.turnId } : {}),
+  }
+}
+
+function routeToolApprovalRespondResult(
+  session: RouteSession,
+  params: ToolApprovalRespondParams,
+): ToolApprovalRespondResult {
+  return {
+    ok: true,
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    requestId: params.requestId,
+    approvalId: params.requestId,
+    reply: params.reply,
+  }
+}
+
+function routeUserInputRespondResult(session: RouteSession, params: UserInputRespondParams): UserInputRespondResult {
+  return {
+    ok: true,
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    requestId: params.requestId,
+    answers: params.answers,
+  }
+}
+
+function routeUserInputRejectResult(session: RouteSession, params: UserInputRejectParams): UserInputRejectResult {
+  return {
+    ok: true,
+    rejected: true,
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    requestId: params.requestId,
+  }
 }
 
 export async function runAppServer(services: AppServerServices) {
@@ -1041,6 +1381,7 @@ export async function runAppServer(services: AppServerServices) {
     }
   } finally {
     lines.close()
+    await services.dispose?.()
   }
 }
 
@@ -1097,6 +1438,14 @@ export async function handleLine(
     const params = sessionListParams(request.params)
     if (!params) return { response: error(id.value, -32602, "Invalid params") }
     return handleAsync(id.value, request.method, () => services.listSessions(params))
+  }
+
+  if (request.method === "session/messages") {
+    const params = sessionMessagesParams(request.params)
+    if (!params) return { response: error(id.value, -32602, "Invalid params") }
+    const sessionMessages = services.sessionMessages
+    if (!sessionMessages) return { response: error(id.value, -32601, "Method not found: session/messages") }
+    return handleAsync(id.value, request.method, () => sessionMessages(params))
   }
 
   if (request.method === "session/status") {
@@ -1243,6 +1592,34 @@ function sessionListParams(value: unknown): SessionListParams | undefined {
     limit,
     order,
   }
+}
+
+function sessionMessagesParams(value: unknown): SessionMessagesParams | undefined {
+  const params = paramsObject(value)
+  if (!params) return undefined
+  const sessionId = firstString(params.sessionId, params.providerSessionId, params.threadId)
+  if (!sessionId) return undefined
+  const limit = optionalPositiveInteger(params.limit)
+  if (params.limit !== undefined && limit === undefined) return undefined
+  if (params.order !== undefined && params.order !== "asc" && params.order !== "desc") return undefined
+  const cursor = sessionMessagesCursor(params.cursor)
+  if (params.cursor !== undefined && !cursor) return undefined
+  return {
+    sessionId,
+    ...(limit ? { limit } : {}),
+    ...(params.order ? { order: params.order } : {}),
+    ...(cursor ? { cursor } : {}),
+  }
+}
+
+function sessionMessagesCursor(value: unknown): SessionMessagesParams["cursor"] | undefined {
+  if (value === undefined) return undefined
+  const params = paramsObject(value)
+  if (!params) return undefined
+  const id = firstString(params.id, params.messageId, params.messageID)
+  if (!id) return undefined
+  if (params.direction !== "previous" && params.direction !== "next") return undefined
+  return { id, direction: params.direction }
 }
 
 function sessionStatusParams(value: unknown): SessionStatusParams | undefined {
@@ -1467,7 +1844,7 @@ function userInputRejectParams(value: unknown): UserInputRejectParams | undefine
   return { sessionId, requestId }
 }
 
-function permissionReplyValue(...values: unknown[]): PermissionV2.Reply | undefined {
+function permissionReplyValue(...values: unknown[]): PermissionReply | undefined {
   for (const value of values) {
     if (value === "once" || value === "allow_once" || value === "accept" || value === "accepted") return "once"
     if (value === "always" || value === "allow_always" || value === "accept_always") return "always"
@@ -1491,310 +1868,9 @@ function initializeResult(): ServerInitializeResult {
       providers: true,
       approvals: true,
       userInput: true,
-      mcp: true,
+      mcp: false,
     },
   }
-}
-
-function sessionCreateResult(session: Session.Info, params: SessionCreateParams): SessionCreateResult {
-  void params
-  return {
-    ...sessionInfo(session),
-  }
-}
-
-function sessionStatusResult(session: Session.Info): SessionStatusResult {
-  return {
-    ...sessionInfo(session),
-    exists: true,
-    active: false,
-    busy: false,
-    pending: false,
-    status: "idle",
-  }
-}
-
-function sessionResumeResult(session: Session.Info): SessionResumeResult {
-  return {
-    resumed: true,
-    sessionId: session.id,
-    providerSessionId: session.id,
-    threadId: session.id,
-  }
-}
-
-function sessionInfo(session: Session.Info): SessionInfo {
-  return {
-    sessionId: session.id,
-    providerSessionId: session.id,
-    threadId: session.id,
-    cwd: session.location.directory,
-    ...(session.model ? modelFields(session.model) : {}),
-    title: session.title,
-    createdAt: isoDate(session.time.created),
-    updatedAt: isoDate(session.time.updated),
-  }
-}
-
-function turnCancelResult(session: Session.Info, active: ActiveTurn | undefined): TurnCancelResult {
-  return {
-    cancelled: true,
-    active: active !== undefined,
-    sessionId: session.id,
-    providerSessionId: session.id,
-    threadId: session.id,
-    ...(active ? { turnId: active.turnId } : {}),
-  }
-}
-
-function toolApprovalRespondResult(
-  session: Session.Info,
-  params: ToolApprovalRespondParams,
-): ToolApprovalRespondResult {
-  return {
-    ok: true,
-    sessionId: session.id,
-    providerSessionId: session.id,
-    threadId: session.id,
-    requestId: params.requestId,
-    approvalId: params.requestId,
-    reply: params.reply,
-  }
-}
-
-function userInputRespondResult(session: Session.Info, params: UserInputRespondParams): UserInputRespondResult {
-  return {
-    ok: true,
-    sessionId: session.id,
-    providerSessionId: session.id,
-    threadId: session.id,
-    requestId: params.requestId,
-    answers: params.answers,
-  }
-}
-
-function userInputRejectResult(session: Session.Info, params: UserInputRejectParams): UserInputRejectResult {
-  return {
-    ok: true,
-    rejected: true,
-    sessionId: session.id,
-    providerSessionId: session.id,
-    threadId: session.id,
-    requestId: params.requestId,
-  }
-}
-
-function isoDate(value: DateTime.Utc) {
-  return new Date(DateTime.toEpochMillis(value)).toISOString()
-}
-
-export function turnNotifications(activeTurns: Map<string, ActiveTurn>, event: EventV2.Payload): JsonRpcNotification[] {
-  const data = record(event.data)
-  const sessionId = stringValue(data.sessionID)
-  if (!sessionId) return []
-  const turn = activeTurns.get(sessionId)
-  if (!turn) return []
-
-  if (event.type === "session.error") {
-    return turnFailureNotifications(activeTurns, sessionId, data.error ?? { type: "unknown", message: "Session failed." })
-  }
-
-  if (event.type === "session.next.interrupt.requested") {
-    void cleanupActiveTurn(activeTurns, sessionId)
-    return [
-      notification("turn/completed", {
-        ...turnBase(turn),
-        status: "cancelled",
-        content: turn.content.join(""),
-        reasoning: turn.reasoning.join(""),
-      }),
-    ]
-  }
-
-  if (event.type === "permission.v2.asked") {
-    const source = record(data.source)
-    return [
-      notification("turn/toolApprovalRequested", {
-        ...turnBase(turn),
-        approvalId: stringValue(data.id),
-        requestId: stringValue(data.id),
-        permission: stringValue(data.action),
-        action: stringValue(data.action),
-        resources: stringArrayValue(data.resources),
-        save: stringArrayValue(data.save),
-        metadata: record(data.metadata),
-        source: data.source,
-        toolCallId: stringValue(source.callID),
-        messageId: stringValue(source.messageID),
-        options: ["once", "always", "reject"],
-      }),
-    ]
-  }
-
-  if (event.type === "permission.v2.replied") {
-    return [
-      notification("turn/toolApprovalResolved", {
-        ...turnBase(turn),
-        approvalId: stringValue(data.requestID),
-        requestId: stringValue(data.requestID),
-        reply: stringValue(data.reply),
-      }),
-    ]
-  }
-
-  if (event.type === "question.v2.asked") {
-    const tool = record(data.tool)
-    return [
-      notification("turn/userInputRequested", {
-        ...turnBase(turn),
-        requestId: stringValue(data.id),
-        questionId: stringValue(data.id),
-        questions: data.questions,
-        tool: data.tool,
-        toolCallId: stringValue(tool.callID),
-        messageId: stringValue(tool.messageID),
-      }),
-    ]
-  }
-
-  if (event.type === "question.v2.replied") {
-    return [
-      notification("turn/userInputResolved", {
-        ...turnBase(turn),
-        requestId: stringValue(data.requestID),
-        questionId: stringValue(data.requestID),
-        status: "answered",
-        answers: data.answers,
-      }),
-    ]
-  }
-
-  if (event.type === "question.v2.rejected") {
-    return [
-      notification("turn/userInputResolved", {
-        ...turnBase(turn),
-        requestId: stringValue(data.requestID),
-        questionId: stringValue(data.requestID),
-        status: "rejected",
-      }),
-    ]
-  }
-
-  if (event.type === "session.next.step.started") {
-    return [
-      notification("turn/started", {
-        ...turnBase(turn),
-        messageId: stringValue(data.assistantMessageID),
-      }).params,
-      notification("turn/modelInfo", {
-        ...turnBase(turn),
-        model: modelPayload(data.model, turn.contextWindow),
-      }).params,
-    ].map((params, index) => notification(index === 0 ? "turn/started" : "turn/modelInfo", params))
-  }
-
-  if (event.type === "session.next.text.delta") {
-    const delta = stringValue(data.delta)
-    if (!delta) return []
-    turn.content.push(delta)
-    return [notification("turn/contentDelta", { ...turnBase(turn), delta, textId: stringValue(data.textID) })]
-  }
-
-  if (event.type === "session.next.reasoning.delta") {
-    const delta = stringValue(data.delta)
-    if (!delta) return []
-    turn.reasoning.push(delta)
-    return [
-      notification("turn/thoughtDelta", {
-        ...turnBase(turn),
-        delta,
-        reasoningId: stringValue(data.reasoningID),
-      }),
-    ]
-  }
-
-  if (event.type === "session.next.tool.called") {
-    return [
-      notification("turn/toolCallRequested", {
-        ...turnBase(turn),
-        toolCallId: stringValue(data.callID),
-        messageId: stringValue(data.assistantMessageID),
-        tool: stringValue(data.tool),
-        input: data.input,
-        provider: data.provider,
-      }),
-    ]
-  }
-
-  if (event.type === "session.next.tool.success") {
-    return [
-      notification("turn/toolCallCompleted", {
-        ...turnBase(turn),
-        status: "completed",
-        toolCallId: stringValue(data.callID),
-        messageId: stringValue(data.assistantMessageID),
-        structured: data.structured,
-        content: data.content,
-        outputPaths: data.outputPaths,
-        result: data.result,
-        provider: data.provider,
-      }),
-    ]
-  }
-
-  if (event.type === "session.next.tool.failed") {
-    return [
-      notification("turn/toolCallCompleted", {
-        ...turnBase(turn),
-        status: "failed",
-        toolCallId: stringValue(data.callID),
-        messageId: stringValue(data.assistantMessageID),
-        error: data.error,
-        result: data.result,
-        provider: data.provider,
-      }),
-    ]
-  }
-
-  if (event.type === "session.next.step.failed") {
-    void cleanupActiveTurn(activeTurns, sessionId)
-    return [
-      notification("turn/error", { ...turnBase(turn), error: data.error }),
-      notification("turn/completed", {
-        ...turnBase(turn),
-        status: "failed",
-        content: turn.content.join(""),
-        reasoning: turn.reasoning.join(""),
-        error: data.error,
-      }),
-    ]
-  }
-
-  if (event.type === "session.next.step.ended") {
-    if (data.finish === "tool-calls") return []
-    void cleanupActiveTurn(activeTurns, sessionId)
-    const usage = tokenUsage(data.tokens, turn.contextWindow)
-    return [
-      notification("turn/completed", {
-        ...turnBase(turn),
-        status: "completed",
-        content: turn.content.join(""),
-        reasoning: turn.reasoning.join(""),
-        finish: data.finish,
-        cost: data.cost,
-        tokens: data.tokens,
-        ...(usage ? { usage } : {}),
-        ...(turn.contextWindow === undefined
-          ? {}
-          : {
-              contextWindow: turn.contextWindow,
-              context_window: turn.contextWindow,
-            }),
-      }),
-    ]
-  }
-
-  return []
 }
 
 function turnFailureNotifications(
@@ -1805,6 +1881,16 @@ function turnFailureNotifications(
   const turn = activeTurns.get(sessionId)
   if (!turn) return []
   void cleanupActiveTurn(activeTurns, sessionId)
+  if (routeAbortError(eventError)) {
+    return [
+      notification("turn/completed", {
+        ...turnBase(turn),
+        status: "cancelled",
+        content: turn.content.join(""),
+        reasoning: turn.reasoning.join(""),
+      }),
+    ]
+  }
   return [
     notification("turn/error", { ...turnBase(turn), error: eventError }),
     notification("turn/completed", {
@@ -1817,10 +1903,24 @@ function turnFailureNotifications(
   ]
 }
 
+function routeAbortError(value: unknown) {
+  const error = record(value)
+  const data = record(error.data)
+  return (
+    stringValue(error.name) === "MessageAbortedError" ||
+    stringValue(error.message) === "Aborted" ||
+    stringValue(data.message) === "Aborted"
+  )
+}
+
 async function cleanupActiveTurn(activeTurns: Map<string, ActiveTurn>, sessionId: string) {
   const turn = activeTurns.get(sessionId)
   activeTurns.delete(sessionId)
   await turn?.cleanup?.()
+}
+
+async function cleanupAllActiveTurns(activeTurns: Map<string, ActiveTurn>) {
+  await Promise.all([...activeTurns.keys()].map((sessionId) => cleanupActiveTurn(activeTurns, sessionId)))
 }
 
 function turnBase(turn: ActiveTurn) {
@@ -1881,30 +1981,6 @@ function firstString(...values: unknown[]) {
   return values.find((value): value is string => typeof value === "string" && value.trim() !== "")
 }
 
-function createSessionID(value: string) {
-  return parseSessionID(value, -32602, `Invalid session id: ${value}`)
-}
-
-function loadedSessionID(value: string) {
-  return parseSessionID(value, -32010, `Session not loaded: ${value}`)
-}
-
-function questionRequestID(value: string) {
-  try {
-    return QuestionV2.ID.make(value)
-  } catch {
-    throw new AppServerError(-32602, `Invalid question request id: ${value}`)
-  }
-}
-
-function parseSessionID(value: string, code: number, message: string) {
-  try {
-    return Session.ID.make(value)
-  } catch {
-    throw new AppServerError(code, message)
-  }
-}
-
 function numberValue(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
@@ -1941,61 +2017,8 @@ function record(value: unknown): Record<string, unknown> {
   return {}
 }
 
-function modelRef(params: ModelSelectionParams): Model.Ref | undefined {
-  if (!params.model) return undefined
-  const providerID = params.provider ?? params.model.split("/")[0]
-  const modelID =
-    params.provider && params.model.startsWith(`${params.provider}/`)
-      ? params.model.slice(params.provider.length + 1)
-      : params.provider
-        ? params.model
-        : params.model.slice(providerID.length + 1)
-  if (!providerID || !modelID) throw new Error("Invalid session model selection.")
-  const variant = stringValue(params.variant) ?? stringValue(params.reasoningEffort)
-  return Schema.decodeUnknownSync(Model.Ref)({
-    providerID,
-    id: modelID,
-    ...(variant && variant !== "default" ? { variant } : {}),
-  })
-}
-
-function instructionModelRef(
-  locations: LocationServices,
-  location: Location.Ref,
-  model: Model.Ref | undefined,
-) {
-  if (model) return Effect.succeed(model)
-  return Effect.gen(function* () {
-    yield* (yield* PluginBoot.Service).wait()
-    const catalog = yield* Catalog.Service
-    const selected = Option.getOrUndefined(yield* catalog.model.default())
-    if (!selected) return undefined
-    return Schema.decodeUnknownSync(Model.Ref)({
-      providerID: selected.providerID,
-      id: selected.id,
-    })
-  }).pipe(Effect.provide(locations.get(location)))
-}
-
-function applyInstructionOverlay(
-  params: InstructionParams,
-  session: Session.Info,
-  model: Model.Ref | undefined,
-  locations: LocationServices,
-) {
-  return SessionInstructionOverlay.Service.use((service) =>
-    service.set(session.id, {
-      ...(params.builtinInstructions === "none"
-        ? {}
-        : { builtin: { id: "opencode-app-server", text: appServerBuiltinPrompt(model, params.hostPlatform) } }),
-      developer: params.developerInstructions,
-      userDeveloper: params.userDeveloperInstructions,
-    }),
-  ).pipe(Effect.provide(locations.get(session.location)))
-}
-
-function appServerBuiltinPrompt(model: Model.Ref | undefined, hostPlatform: string | undefined) {
-  const modelID = model ? `${model.providerID}/${model.id}${model.variant ? `/${model.variant}` : ""}` : undefined
+function appServerBuiltinPrompt(model: RouteModelSelection | undefined, hostPlatform: string | undefined) {
+  const modelID = model ? `${model.providerID}/${model.modelID}${model.variant ? `/${model.variant}` : ""}` : undefined
   const platform = hostPlatform?.trim() ? `the ${hostPlatform.trim()} platform` : "an app-server host platform"
   return [
     `You are OpenCode running through ${platform}.`,
@@ -2011,188 +2034,6 @@ function resolveCwd(cwd: string) {
   const resolved = fs.realpathSync(cwd)
   if (!fs.statSync(resolved).isDirectory()) throw new Error("Session cwd is not a directory.")
   return resolved
-}
-
-function discoverableProvider(provider: ProviderV2.Info) {
-  return Boolean(provider.enabled) || provider.id === ProviderV2.ID.opencode
-}
-
-function discoverableModels(providers: readonly ProviderV2.Info[], models: readonly ModelV2.Info[]) {
-  const providerIDs = new Set(providers.map((provider) => provider.id))
-  return models.filter((model) => model.enabled && providerIDs.has(model.providerID))
-}
-
-function providerListResult(
-  providers: readonly ProviderV2.Info[],
-  models: readonly ModelV2.Info[],
-  defaultModel: Option.Option<ModelV2.Info>,
-): ProviderListResult {
-  return {
-    data: providers
-      .map((provider) => providerInfo(provider, models, Option.getOrUndefined(defaultModel)))
-      .sort((a, b) => a.id.localeCompare(b.id)),
-    ...(Option.isSome(defaultModel) ? { default: defaultModel.value.providerID } : {}),
-  }
-}
-
-function providerInfo(
-  provider: ProviderV2.Info,
-  models: readonly ModelV2.Info[],
-  defaultModel: ModelV2.Info | undefined,
-): ProviderInfo {
-  const providerModels = models.filter((model) => model.providerID === provider.id)
-  const defaultProviderModel =
-    defaultModel?.providerID === provider.id
-      ? defaultModel.id
-      : [...providerModels].sort((a, b) => a.id.localeCompare(b.id))[0]?.id
-  return {
-    id: provider.id,
-    value: provider.id,
-    name: provider.name,
-    label: provider.name,
-    displayName: provider.name,
-    ...(defaultProviderModel ? { defaultModel: defaultProviderModel } : {}),
-    source: "catalog",
-    capabilities: {
-      source: "catalog",
-      modelCount: providerModels.length,
-      env: provider.env,
-      enabled: provider.enabled,
-      api: provider.api,
-    },
-  }
-}
-
-function modelListResult(
-  providers: readonly ProviderV2.Info[],
-  models: readonly ModelV2.Info[],
-  defaultModel: Option.Option<ModelV2.Info>,
-  params: ModelListParams,
-  runtimeVariants: RuntimeVariantIndex,
-): ModelListResult {
-  const providerByID = new Map(providers.map((provider) => [provider.id, provider]))
-  return {
-    data: models
-      .filter((model) => !params.provider || model.providerID === params.provider)
-      .map((model) => modelInfo(providerByID.get(model.providerID), model, runtimeVariants))
-      .sort((a, b) => a.id.localeCompare(b.id)),
-    ...(Option.isSome(defaultModel) && (!params.provider || defaultModel.value.providerID === params.provider)
-      ? { default: `${defaultModel.value.providerID}/${defaultModel.value.id}` }
-      : {}),
-  }
-}
-
-function modelVariantListResult(
-  models: readonly ModelV2.Info[],
-  params: ModelVariantListParams,
-  runtimeVariants: RuntimeVariantIndex,
-): ModelVariantListResult {
-  const selected = modelSelection(params.provider, params.model)
-  const model = models.find(
-    (item) =>
-      (!selected.providerID || item.providerID === selected.providerID) &&
-      (!selected.modelID || item.id === selected.modelID) &&
-      (selected.providerID !== undefined || selected.modelID !== undefined),
-  )
-  const variants = model ? modelVariants(model, runtimeVariants) : []
-  return {
-    data: variants,
-    default: variants[0]?.value ?? "",
-  }
-}
-
-function modelInfo(
-  provider: ProviderV2.Info | undefined,
-  model: ModelV2.Info,
-  runtimeVariants: RuntimeVariantIndex,
-): ModelInfo {
-  const providerName = provider?.name ?? model.providerID
-  const variants = modelVariants(model, runtimeVariants)
-  const thinking = variants.length > 0 || model.capabilities.output.some((item) => item.includes("reasoning"))
-  return {
-    id: `${model.providerID}/${model.id}`,
-    value: `${model.providerID}/${model.id}`,
-    provider: model.providerID,
-    providerID: model.providerID,
-    model: model.id,
-    modelID: model.id,
-    name: model.name,
-    label: `${model.name} (${providerName})`,
-    displayName: model.name,
-    family: model.family ?? model.providerID,
-    supported_reasoning_efforts: variants,
-    supportedReasoningEfforts: variants,
-    default_reasoning_effort: variants[0]?.value ?? "",
-    defaultReasoningEffort: variants[0]?.value ?? "",
-    features: {
-      thinking,
-      multimodalToolUse: model.capabilities.input.some((item) => !item.startsWith("text")),
-    },
-    capabilities: {
-      providerID: model.providerID,
-      modelID: model.id,
-      status: model.status,
-      context: model.limit.context,
-      input: model.limit.input,
-      output: model.limit.output,
-      tools: model.capabilities.tools,
-      modalities: model.capabilities.input,
-      outputModalities: model.capabilities.output,
-      reasoning: thinking,
-      api: model.api,
-      variants: variants.map((variant) => variant.id),
-      cost: model.cost,
-    },
-  }
-}
-
-function runtimeVariantIndexEffect() {
-  return ModelsDev.Service.use((service) => service.get()).pipe(
-    Effect.map(runtimeVariantIndex),
-    Effect.provide(ModelsDev.defaultLayer),
-  )
-}
-
-function runtimeVariantIndex(data: Record<string, ModelsDev.Provider>): RuntimeVariantIndex {
-  const result = new Map<string, Record<string, Record<string, unknown>>>()
-  for (const provider of Object.values(data)) {
-    const runtimeProvider = Provider.fromModelsDevProvider(provider)
-    for (const model of Object.values(runtimeProvider.models)) {
-      if (model.variants && Object.keys(model.variants).length > 0) {
-        result.set(modelKey(runtimeProvider.id, model.id), model.variants)
-      }
-    }
-  }
-  return result
-}
-
-function modelVariants(model: ModelV2.Info, runtimeVariants: RuntimeVariantIndex): ModelVariantInfo[] {
-  const result = new Map<string, ModelVariantInfo>()
-  for (const [id, request] of Object.entries(runtimeVariants.get(modelKey(model.providerID, model.id)) ?? {})) {
-    result.set(id, runtimeVariantInfo(id, request))
-  }
-  for (const variant of model.variants) {
-    const request = {
-      headers: { ...variant.headers },
-      body: { ...variant.body },
-      generation: { ...variant.generation },
-      options: { ...variant.options },
-    }
-    result.set(variant.id, {
-      id: variant.id,
-      value: variant.id,
-      label: variant.id,
-      variant: variant.id,
-      reasoningEffort: variant.id,
-      ...request,
-      request,
-      raw: {
-        id: variant.id,
-        ...request,
-      },
-    })
-  }
-  return [...result.values()]
 }
 
 function runtimeVariantInfo(id: string, request: Record<string, unknown>): ModelVariantInfo {
@@ -2225,10 +2066,6 @@ function runtimeVariantInfo(id: string, request: Record<string, unknown>): Model
   }
 }
 
-function modelKey(providerID: string, modelID: string) {
-  return `${providerID}/${modelID}`
-}
-
 function objectRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
@@ -2249,14 +2086,6 @@ function modelSelection(provider: string | undefined, model: string | undefined)
   if (provider) return { providerID: provider, modelID: model }
   const providerID = model.split("/")[0]
   return { providerID, modelID: model.slice(providerID.length + 1) }
-}
-
-function modelFields(model: Model.Ref) {
-  return {
-    provider: model.providerID,
-    model: model.id,
-    ...(model.variant ? { variant: model.variant } : {}),
-  }
 }
 
 function result(id: JsonRpcID, value: unknown): JsonRpcResponse {
@@ -2312,10 +2141,6 @@ function stringifyUnknown(value: unknown) {
   } catch {
     return String(value)
   }
-}
-
-function causeError(cause: Cause.Cause<unknown>) {
-  return new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject()
 }
 
 function jsonRpcWriter() {

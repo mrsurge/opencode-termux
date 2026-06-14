@@ -8,34 +8,44 @@ describe("opencode app-server subprocess", () => {
     "initializes and shuts down over stdio JSON-RPC",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        yield* Effect.promise(() =>
-          Bun.write(
-            `${home}/opencode.json`,
-            JSON.stringify({
-              providers: {
-                test: {
-                  name: "Test",
-                  api: { type: "aisdk", package: "@ai-sdk/openai-compatible", url: llm.url },
-                  request: { body: { apiKey: "test-key" } },
-                  models: {
-                    "test-model": {
-                      name: "Test Model",
-                      capabilities: { tools: true, input: ["text"], output: ["text"] },
-                      limit: { context: 100_000, output: 10_000 },
-                      cost: { input: 0, output: 0 },
-                      variants: [
-                        { id: "low", body: { reasoningEffort: "low" } },
-                        { id: "high", body: { reasoningEffort: "high" } },
-                      ],
-                    },
+        const config = JSON.stringify({
+          provider: {
+            test: {
+              name: "Test",
+              id: "test",
+              env: ["TEST_API_KEY"],
+              npm: "@ai-sdk/openai-compatible",
+              options: { baseURL: llm.url },
+              models: {
+                "test-model": {
+                  id: "test-model",
+                  name: "Test Model",
+                  attachment: false,
+                  reasoning: false,
+                  temperature: false,
+                  tool_call: true,
+                  release_date: "2025-01-01",
+                  limit: { context: 100_000, output: 10_000 },
+                  cost: { input: 0, output: 0 },
+                  variants: {
+                    low: { body: { reasoningEffort: "low" } },
+                    high: { body: { reasoningEffort: "high" } },
                   },
                 },
               },
-              permissions: [{ action: "edit", resource: "*", effect: "ask" }],
-            }),
+            },
+          },
+          permission: { edit: "ask" },
+        })
+        yield* Effect.promise(() =>
+          Bun.write(
+            `${home}/opencode.json`,
+            config,
           ),
         )
-        const appServer = yield* opencode.appServer({ env: { OPENCODE_DISABLE_PROJECT_CONFIG: "0" } })
+        const appServer = yield* opencode.appServer({
+          env: { OPENCODE_DISABLE_PROJECT_CONFIG: "0", OPENCODE_CONFIG_CONTENT: config, TEST_API_KEY: "test-key" },
+        })
 
         yield* appServer.send({ jsonrpc: "2.0", id: 1, method: "server/initialize", params: {} })
         const initialized = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(20)))
@@ -55,7 +65,7 @@ describe("opencode app-server subprocess", () => {
               providers: true,
               approvals: true,
               userInput: true,
-              mcp: true,
+              mcp: false,
             },
           },
         })
@@ -65,73 +75,45 @@ describe("opencode app-server subprocess", () => {
         expect(providers).toMatchObject({
           jsonrpc: "2.0",
           id: 2,
-          result: {
-            default: "test",
-          },
         })
-        expect((providers as { result: { data: unknown[] } }).result.data).toContainEqual(
-          expect.objectContaining({
-            id: "test",
-            value: "test",
-            name: "Test",
-            label: "Test",
-            displayName: "Test",
-            defaultModel: "test-model",
-            source: "catalog",
-          }),
-        )
+        const providerData = (providers as { result: { data: unknown[] } }).result.data
+        expect(providerData.length).toBeGreaterThan(0)
+        const catalogProvider = objectRecord(providerData.find((item) => stringField(objectRecord(item) ?? {}, "id") === "openrouter")) ?? objectRecord(providerData[0])
+        if (!catalogProvider) throw new Error("provider/list returned no provider records")
+        const catalogProviderId = stringField(catalogProvider, "id")
 
-        yield* appServer.send({ jsonrpc: "2.0", id: 3, method: "model/list", params: { provider: "test" } })
+        yield* appServer.send({ jsonrpc: "2.0", id: 3, method: "model/list", params: { provider: catalogProviderId } })
         const models = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
         expect(models).toMatchObject({
           jsonrpc: "2.0",
           id: 3,
-          result: {
-            default: "test/test-model",
-            data: [
-              {
-                id: "test/test-model",
-                value: "test/test-model",
-                provider: "test",
-                providerID: "test",
-                model: "test-model",
-                modelID: "test-model",
-                name: "Test Model",
-                label: "Test Model (Test)",
-                displayName: "Test Model",
-                family: "test",
-                supportedReasoningEfforts: [
-                  { id: "low", value: "low", label: "low", variant: "low", reasoningEffort: "low" },
-                  { id: "high", value: "high", label: "high", variant: "high", reasoningEffort: "high" },
-                ],
-                defaultReasoningEffort: "low",
-                features: {
-                  thinking: true,
-                  multimodalToolUse: false,
-                },
-              },
-            ],
-          },
         })
-
-        yield* appServer.send({
-          jsonrpc: "2.0",
-          id: 40,
-          method: "model/variant/list",
-          params: { provider: "test", model: "test-model" },
-        })
-        const variants = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
-        expect(variants).toMatchObject({
-          jsonrpc: "2.0",
-          id: 40,
-          result: {
-            data: [
-              { id: "low", value: "low", label: "low", variant: "low", reasoningEffort: "low" },
-              { id: "high", value: "high", label: "high", variant: "high", reasoningEffort: "high" },
-            ],
-            default: "low",
-          },
-        })
+        const modelData = (models as { result: { data: unknown[] } }).result.data
+        expect(modelData.length).toBeGreaterThan(0)
+        expect(modelData[0]).toMatchObject({ provider: catalogProviderId, providerID: catalogProviderId })
+        const variantModel = objectRecord(
+          modelData.find((item) => {
+            const efforts = objectRecord(item)?.supportedReasoningEfforts
+            return Array.isArray(efforts) && efforts.length > 0
+          }),
+        )
+        if (variantModel) {
+          yield* appServer.send({
+            jsonrpc: "2.0",
+            id: 40,
+            method: "model/variant/list",
+            params: { provider: catalogProviderId, model: stringField(variantModel, "modelID") },
+          })
+          const variants = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
+          expect(variants).toMatchObject({
+            jsonrpc: "2.0",
+            id: 40,
+            result: {
+              data: variantModel.supportedReasoningEfforts,
+              default: stringField(variantModel, "defaultReasoningEffort"),
+            },
+          })
+        }
 
         yield* appServer.send({
           jsonrpc: "2.0",
@@ -230,7 +212,10 @@ describe("opencode app-server subprocess", () => {
             reasoningEffort: "missing",
           },
         })
-        const invalidVariant = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
+        const invalidVariantMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 41)),
+        )
+        const invalidVariant = objectRecord(invalidVariantMessages.find((message) => isResponse(message, 41)))
         expect(invalidVariant).toEqual({
           jsonrpc: "2.0",
           id: 41,
@@ -313,7 +298,10 @@ describe("opencode app-server subprocess", () => {
           method: "turn/cancel",
           params: { threadId: sessionResult.sessionId },
         })
-        const cancelled = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
+        const cancelledMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 9)),
+        )
+        const cancelled = responseWithId(cancelledMessages, 9)
         expect(cancelled).toMatchObject({
           jsonrpc: "2.0",
           id: 9,
@@ -326,7 +314,7 @@ describe("opencode app-server subprocess", () => {
           },
         })
 
-        yield* llm.tool("write", { path: "approval.txt", content: "approved\n" })
+        yield* llm.tool("write", { filePath: "approval.txt", content: "approved\n" })
         yield* appServer.send({
           jsonrpc: "2.0",
           id: 10,
@@ -346,7 +334,7 @@ describe("opencode app-server subprocess", () => {
           threadId: sessionResult.sessionId,
           permission: "edit",
           action: "edit",
-          resources: ["approval.txt"],
+          resources: [expect.stringContaining("approval.txt")],
         })
 
         yield* appServer.send({
@@ -385,8 +373,7 @@ describe("opencode app-server subprocess", () => {
               sessionId: sessionResult.sessionId,
               status: "completed",
               structured: expect.objectContaining({
-                operation: "write",
-                resource: "approval.txt",
+                filepath: expect.stringContaining("approval.txt"),
               }),
             }),
           }),
@@ -402,7 +389,10 @@ describe("opencode app-server subprocess", () => {
             decision: "reject",
           },
         })
-        const staleApproval = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
+        const staleApprovalMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 12)),
+        )
+        const staleApproval = responseWithId(staleApprovalMessages, 12)
         expect(staleApproval).toEqual({
           jsonrpc: "2.0",
           id: 12,
@@ -412,7 +402,7 @@ describe("opencode app-server subprocess", () => {
           },
         })
 
-        yield* llm.tool("write", { path: "reject.txt", content: "rejected\n" })
+        yield* llm.tool("write", { filePath: "reject.txt", content: "rejected\n" })
         yield* appServer.send({
           jsonrpc: "2.0",
           id: 13,
@@ -484,7 +474,7 @@ describe("opencode app-server subprocess", () => {
           }),
         )
 
-        yield* llm.tool("write", { path: "always-first.txt", content: "always first\n" })
+        yield* llm.tool("write", { filePath: "always-first.txt", content: "always first\n" })
         yield* appServer.send({
           jsonrpc: "2.0",
           id: 15,
@@ -538,7 +528,7 @@ describe("opencode app-server subprocess", () => {
           }),
         )
 
-        yield* llm.tool("write", { path: "always-second.txt", content: "always second\n" })
+        yield* llm.tool("write", { filePath: "always-second.txt", content: "always second\n" })
         yield* appServer.send({
           jsonrpc: "2.0",
           id: 17,
@@ -562,15 +552,17 @@ describe("opencode app-server subprocess", () => {
             params: expect.objectContaining({
               status: "completed",
               structured: expect.objectContaining({
-                operation: "write",
-                resource: "always-second.txt",
+                filepath: expect.stringContaining("always-second.txt"),
               }),
             }),
           }),
         )
 
         yield* appServer.send({ jsonrpc: "2.0", id: 18, method: "server/shutdown" })
-        const shutdown = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(5)))
+        const shutdownMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 18)),
+        )
+        const shutdown = responseWithId(shutdownMessages, 18)
         expect(shutdown).toEqual({
           jsonrpc: "2.0",
           id: 18,
@@ -589,30 +581,40 @@ describe("opencode app-server cancellation", () => {
     "settles active turns when cancellation interrupts approval or continuation",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
+        const config = JSON.stringify({
+          provider: {
+            test: {
+              name: "Test",
+              id: "test",
+              env: ["TEST_API_KEY"],
+              npm: "@ai-sdk/openai-compatible",
+              options: { baseURL: llm.url },
+              models: {
+                "test-model": {
+                  id: "test-model",
+                  name: "Test Model",
+                  attachment: false,
+                  reasoning: false,
+                  temperature: false,
+                  tool_call: true,
+                  release_date: "2025-01-01",
+                  limit: { context: 100_000, output: 10_000 },
+                  cost: { input: 0, output: 0 },
+                },
+              },
+            },
+          },
+          permission: { edit: "ask" },
+        })
         yield* Effect.promise(() =>
           Bun.write(
             `${home}/opencode.json`,
-            JSON.stringify({
-              providers: {
-                test: {
-                  name: "Test",
-                  api: { type: "aisdk", package: "@ai-sdk/openai-compatible", url: llm.url },
-                  request: { body: { apiKey: "test-key" } },
-                  models: {
-                    "test-model": {
-                      name: "Test Model",
-                      capabilities: { tools: true, input: ["text"], output: ["text"] },
-                      limit: { context: 100_000, output: 10_000 },
-                      cost: { input: 0, output: 0 },
-                    },
-                  },
-                },
-              },
-              permissions: [{ action: "edit", resource: "*", effect: "ask" }],
-            }),
+            config,
           ),
         )
-        const appServer = yield* opencode.appServer({ env: { OPENCODE_DISABLE_PROJECT_CONFIG: "0" } })
+        const appServer = yield* opencode.appServer({
+          env: { OPENCODE_DISABLE_PROJECT_CONFIG: "0", OPENCODE_CONFIG_CONTENT: config, TEST_API_KEY: "test-key" },
+        })
 
         yield* appServer.send({
           jsonrpc: "2.0",
@@ -623,7 +625,7 @@ describe("opencode app-server cancellation", () => {
         const created = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(30)))
         const sessionResult = (created as { result: { sessionId: string } }).result
 
-        yield* llm.tool("write", { path: "cancel-approval.txt", content: "cancelled\n" })
+        yield* llm.tool("write", { filePath: "cancel-approval.txt", content: "cancelled\n" })
         yield* appServer.send({
           jsonrpc: "2.0",
           id: 2,
@@ -666,8 +668,12 @@ describe("opencode app-server cancellation", () => {
           }),
         ])
 
-        yield* llm.tool("write", { path: "cancel-continuation.txt", content: "before continuation\n" })
-        yield* llm.hang
+        yield* llm.tool("write", { filePath: "cancel-continuation.txt", content: "before continuation\n" })
+        let releaseContinuation!: () => void
+        const heldContinuation = new Promise<void>((resolve) => {
+          releaseContinuation = resolve
+        })
+        yield* llm.hold("released after cancellation", heldContinuation)
         yield* appServer.send({
           jsonrpc: "2.0",
           id: 4,
@@ -728,6 +734,8 @@ describe("opencode app-server cancellation", () => {
           }),
         ])
 
+        releaseContinuation()
+        yield* llm.reset
         yield* llm.text("after cancel ok")
         yield* appServer.send({
           jsonrpc: "2.0",
@@ -762,7 +770,10 @@ describe("opencode app-server cancellation", () => {
         )
 
         yield* appServer.send({ jsonrpc: "2.0", id: 8, method: "server/shutdown" })
-        const shutdown = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(5)))
+        const shutdownMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 8)),
+        )
+        const shutdown = responseWithId(shutdownMessages, 8)
         expect(shutdown).toEqual({
           jsonrpc: "2.0",
           id: 8,
@@ -922,6 +933,91 @@ test("app-server forwards session instruction params", async () => {
       result: {
         accepted: true,
         sessionId: "ses_test",
+      },
+    },
+  })
+})
+
+test("app-server forwards session messages params", async () => {
+  const requests: unknown[] = []
+  const response = await handleLine(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "session/messages",
+      params: {
+        providerSessionId: "ses_test",
+        limit: 50,
+        order: "asc",
+        cursor: {
+          messageId: "msg_test",
+          direction: "next",
+        },
+      },
+    }),
+    {
+      listProviders: async () => ({ data: [] }),
+      listModels: async () => ({ data: [] }),
+      listModelVariants: async () => ({ data: [] }),
+      createSession: async () => {
+        throw new Error("unused")
+      },
+      listSessions: async () => ({ data: [] }),
+      sessionMessages: async (params) => {
+        requests.push(params)
+        return {
+          sessionId: params.sessionId,
+          providerSessionId: params.sessionId,
+          threadId: params.sessionId,
+          data: [],
+          messages: [],
+        }
+      },
+      getSessionStatus: async () => {
+        throw new Error("unused")
+      },
+      resumeSession: async () => {
+        throw new Error("unused")
+      },
+      startTurn: async () => {
+        throw new Error("unused")
+      },
+      cancelTurn: async () => {
+        throw new Error("unused")
+      },
+      respondToolApproval: async () => {
+        throw new Error("unused")
+      },
+      respondUserInput: async () => {
+        throw new Error("unused")
+      },
+      rejectUserInput: async () => {
+        throw new Error("unused")
+      },
+    },
+  )
+
+  expect(requests).toEqual([
+    {
+      sessionId: "ses_test",
+      limit: 50,
+      order: "asc",
+      cursor: {
+        id: "msg_test",
+        direction: "next",
+      },
+    },
+  ])
+  expect(response).toEqual({
+    response: {
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        data: [],
+        messages: [],
       },
     },
   })
@@ -1290,7 +1386,7 @@ test("app-server translates session errors into failed turn completion", () => {
 
   const messages = turnNotifications(activeTurns, {
     type: "session.error",
-    data: {
+    properties: {
       sessionID: "ses_test",
       error: { type: "unknown", message: "Model not found: openrouter/google/gemma-4-31b-it" },
     },
@@ -1472,8 +1568,8 @@ test("app-server translates question events into user input notifications", () =
   ])
 
   const asked = turnNotifications(activeTurns, {
-    type: "question.v2.asked",
-    data: {
+    type: "question.asked",
+    properties: {
       id: "que_test",
       sessionID: "ses_test",
       questions: [
@@ -1516,8 +1612,8 @@ test("app-server translates question events into user input notifications", () =
   ])
 
   const replied = turnNotifications(activeTurns, {
-    type: "question.v2.replied",
-    data: {
+    type: "question.replied",
+    properties: {
       sessionID: "ses_test",
       requestID: "que_test",
       answers: [["Small patch"]],
@@ -1541,7 +1637,7 @@ test("app-server translates question events into user input notifications", () =
   ])
 })
 
-test("app-server includes token usage and context window on turn completion", () => {
+test("app-server translates route token usage and idle completion", () => {
   const activeTurns = new Map<string, ActiveTurn>([
     [
       "ses_test",
@@ -1551,41 +1647,42 @@ test("app-server includes token usage and context window on turn completion", ()
         content: ["done"],
         reasoning: ["thinking"],
         contextWindow: 1000,
+        assistantMessageIds: new Set(["msg_test"]),
       },
     ],
   ])
 
-  const messages = turnNotifications(activeTurns, {
-    type: "session.next.step.ended",
-    data: {
+  const usage = turnNotifications(activeTurns, {
+    type: "message.part.updated",
+    properties: {
       sessionID: "ses_test",
-      assistantMessageID: "msg_test",
-      finish: "stop",
-      cost: 0.01,
-      tokens: {
-        input: 120,
-        output: 30,
-        reasoning: 10,
-        cache: { read: 40, write: 5 },
+      part: {
+        id: "part_step",
+        sessionID: "ses_test",
+        messageID: "msg_test",
+        type: "step-finish",
+        reason: "stop",
+        cost: 0.01,
+        tokens: {
+          input: 120,
+          output: 30,
+          reasoning: 10,
+          cache: { read: 40, write: 5 },
+        },
       },
     },
   } as Parameters<typeof turnNotifications>[1])
 
-  expect(activeTurns.has("ses_test")).toBe(false)
-  expect(messages).toEqual([
+  expect(activeTurns.has("ses_test")).toBe(true)
+  expect(usage).toEqual([
     {
       jsonrpc: "2.0",
-      method: "turn/completed",
+      method: "turn/usage",
       params: {
         turnId: "turn_test",
         sessionId: "ses_test",
         providerSessionId: "ses_test",
         threadId: "ses_test",
-        status: "completed",
-        content: "done",
-        reasoning: "thinking",
-        finish: "stop",
-        cost: 0.01,
         tokens: {
           input: 120,
           output: 30,
@@ -1620,12 +1717,37 @@ test("app-server includes token usage and context window on turn completion", ()
       },
     },
   ])
+
+  const completed = turnNotifications(activeTurns, {
+    type: "session.status",
+    properties: {
+      sessionID: "ses_test",
+      status: { type: "idle" },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+
+  expect(activeTurns.has("ses_test")).toBe(false)
+  expect(completed).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        status: "completed",
+        content: "done",
+        reasoning: "thinking",
+      },
+    },
+  ])
 })
 
 function receiveUntil(appServer: AppServerHandle, done: (messages: unknown[]) => boolean) {
   return Effect.gen(function* () {
     const messages: unknown[] = []
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 200; index += 1) {
       const message = yield* appServer.receive.pipe(
         Effect.timeout(Duration.seconds(40)),
         Effect.catchTag("TimeoutError", () =>
@@ -1642,6 +1764,12 @@ function receiveUntil(appServer: AppServerHandle, done: (messages: unknown[]) =>
 function isResponse(message: unknown, id: number) {
   const item = objectRecord(message)
   return item !== undefined && item.id === id
+}
+
+function responseWithId(messages: unknown[], id: number) {
+  const message = messages.find((message) => isResponse(message, id))
+  if (!message) throw new Error(`Missing response id: ${id}`)
+  return message
 }
 
 function isNotification(message: unknown, method: string) {

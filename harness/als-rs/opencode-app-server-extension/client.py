@@ -32,6 +32,7 @@ _registered_extension_ids: set[str] = set()
 _ready_extensions: set[str] = set()
 _raw_buffer: List[Dict[str, object]] = []
 _RAW_BUFFER_MAX = 1000
+_HISTORY_IMPORT_PAGE_SIZE = 100
 _FULL_SESSION_HYDRATE: Dict[str, object] = {"mode": "full"}
 _DEFAULT_APPROVAL_POLICY = "ask"
 _APPROVAL_POLICY_OPTIONS: List[Dict[str, object]] = [
@@ -437,16 +438,20 @@ def _mcp_servers_from_settings(settings: Optional[Dict[str, object]]) -> Optiona
     if not direct_servers:
         direct_servers = _object_dict(settings.get("mcp_servers"))
     context = _object_dict(settings.get("mcp_context"))
-    if not direct_servers and not context:
+    integration_enabled = settings.get("te2_mcp_integration") is True
+    if not direct_servers and (not context or not integration_enabled):
         return None
 
     servers: Dict[str, object] = {}
-    requested_servers = _object_dict(context.get("requested_servers"))
+    requested_servers = _object_dict(context.get("requested_servers")) if integration_enabled else {}
     for name, server in {**direct_servers, **requested_servers}.items():
         normalized = _normalize_mcp_server(server)
         if normalized is None:
             raise ValueError(f"Invalid MCP server config: {name}")
         servers[str(name)] = normalized
+
+    if not integration_enabled:
+        return servers or None
 
     defaults = _object_dict(context.get("defaults"))
     agent_pty_defaults = _object_dict(defaults.get(_AGENT_PTY_BLOCKS_MCP_SERVER_NAME))
@@ -945,25 +950,19 @@ async def resume_session_with_history(
     if existing_session_id and existing_session_id != session_id:
         return {"ok": False, "error": f"Conversation already bound to session {existing_session_id[:8]}"}
     session_name = _active_session_name(meta, provider_session_id=session_id, settings=settings)
-    approval_policy = _approval_policy_from_settings(merged_settings)
-    sandbox = _app_server_sandbox_from_policy(_sandbox_policy_from_settings(merged_settings))
-    reasoning_effort = _reasoning_effort_from_settings(merged_settings)
-    instructions = _instruction_params_from_settings(merged_settings)
-    mcp_servers = _mcp_servers_from_settings(merged_settings)
-    session = await _ensure_bound_provider_session_loaded(
-        transport,
-        conversation_id=conversation_id,
-        session_name=session_name,
-        provider_session_id=session_id,
-        cwd=resolved_cwd,
-        model=resolved_model,
-        provider=resolved_provider,
-        approval_policy=approval_policy,
-        sandbox=sandbox,
-        reasoning_effort=reasoning_effort,
-        instructions=instructions,
-        mcp_servers=mcp_servers,
+    status_result = await transport.rpc_request(
+        "session/status",
+        params={"sessionId": session_id},
+        timeout=10.0,
     )
+    session = _object_dict(status_result)
+    status_session_id = _string_value(
+        session.get("providerSessionId"),
+        session.get("sessionId"),
+        session.get("threadId"),
+    )
+    if status_session_id != session_id:
+        return {"ok": False, "error": "session/status did not confirm selected provider session"}
     merged_settings = _persistent_settings(settings)
     merged_settings["cwd"] = resolved_cwd
     if resolved_model:
@@ -986,6 +985,222 @@ async def resume_session_with_history(
     }
 
 
+def _history_timestamp(message: Dict[str, object]) -> str:
+    time_info = _object_dict(message.get("time"))
+    return _string_value(time_info.get("completed"), time_info.get("created"))
+
+
+def _history_base_entry(
+    role: str,
+    *,
+    conversation_id: str,
+    message: Dict[str, object],
+    item_id: str,
+) -> Dict[str, object]:
+    timestamp = _history_timestamp(message)
+    entry: Dict[str, object] = {
+        "role": role,
+        "conversation_id": conversation_id,
+        "item_id": item_id,
+        "id": item_id,
+        "source": "opencode-app-server",
+    }
+    if timestamp:
+        entry["timestamp"] = timestamp
+        entry["ts"] = timestamp
+    return entry
+
+
+def _json_text(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
+def _history_tool_content_text(value: object) -> str:
+    parts: List[str] = []
+    for item in _object_list(value):
+        item_dict = _object_dict(item)
+        text = _string_value(item_dict.get("text"))
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _history_tool_arguments(state: Dict[str, object]) -> Dict[str, object]:
+    raw_input = state.get("input")
+    input_map = _object_dict(raw_input)
+    if input_map:
+        return input_map
+    if isinstance(raw_input, str) and raw_input:
+        return {"input": raw_input}
+    return {}
+
+
+def _history_tool_result(state: Dict[str, object]) -> str:
+    content = _history_tool_content_text(state.get("content"))
+    if content:
+        return content
+    result = state.get("result")
+    if result is not None:
+        return _json_text(result)
+    structured = state.get("structured")
+    if structured is not None:
+        return _json_text(structured)
+    return ""
+
+
+def _history_tool_entry(
+    *,
+    conversation_id: str,
+    message: Dict[str, object],
+    part: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    tool_id = _string_value(part.get("id"))
+    tool_name = _string_value(part.get("name"))
+    if not tool_id or not tool_name:
+        return None
+    state = _object_dict(part.get("state"))
+    status = _string_value(state.get("status")) or "unknown"
+    entry = _history_base_entry(
+        "tool",
+        conversation_id=conversation_id,
+        message=message,
+        item_id=tool_id,
+    )
+    entry.update({
+        "tool": tool_name,
+        "arguments": _history_tool_arguments(state),
+        "result": _history_tool_result(state),
+        "status": "failed" if status == "error" else status,
+        "is_error": status == "error",
+        "event": "history_tool",
+    })
+    error = _object_dict(state.get("error"))
+    if error:
+        entry["error"] = error
+    return entry
+
+
+def _history_assistant_entries(
+    *,
+    conversation_id: str,
+    message: Dict[str, object],
+) -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    message_id = _string_value(message.get("id"))
+    for index, part in enumerate(_object_list(message.get("content"))):
+        part_map = _object_dict(part)
+        part_type = _string_value(part_map.get("type"))
+        part_id = _string_value(part_map.get("id")) or f"{message_id}:part:{index}"
+        if part_type == "text":
+            text = _string_value(part_map.get("text"))
+            if text:
+                entry = _history_base_entry(
+                    "assistant",
+                    conversation_id=conversation_id,
+                    message=message,
+                    item_id=part_id,
+                )
+                entry["text"] = text
+                entries.append(entry)
+        elif part_type == "reasoning":
+            text = _string_value(part_map.get("text"))
+            if text:
+                entry = _history_base_entry(
+                    "reasoning",
+                    conversation_id=conversation_id,
+                    message=message,
+                    item_id=part_id,
+                )
+                entry["text"] = text
+                entries.append(entry)
+        elif part_type == "tool":
+            tool_entry = _history_tool_entry(
+                conversation_id=conversation_id,
+                message=message,
+                part=part_map,
+            )
+            if tool_entry is not None:
+                entries.append(tool_entry)
+    return entries
+
+
+def _history_message_entries(
+    *,
+    conversation_id: str,
+    message: Dict[str, object],
+) -> List[Dict[str, object]]:
+    message_type = _string_value(message.get("type"))
+    message_id = _string_value(message.get("id"))
+    if message_type == "user":
+        text = _string_value(message.get("text"))
+        if not text:
+            return []
+        entry = _history_base_entry(
+            "user",
+            conversation_id=conversation_id,
+            message=message,
+            item_id=message_id,
+        )
+        entry["text"] = text
+        return [entry]
+    if message_type == "assistant":
+        return _history_assistant_entries(
+            conversation_id=conversation_id,
+            message=message,
+        )
+    if message_type == "shell":
+        command = _string_value(message.get("command"))
+        output = _string_value(message.get("output"))
+        if not command and not output:
+            return []
+        entry = _history_base_entry(
+            "command",
+            conversation_id=conversation_id,
+            message=message,
+            item_id=message_id,
+        )
+        entry.update({
+            "command": command,
+            "output": output,
+            "exit_code": 0,
+            "status": "completed",
+            "event": "history_shell",
+        })
+        return [entry]
+    return []
+
+
+async def _broadcast_history_import_activity(
+    *,
+    conversation_id: str,
+    label: str,
+    active: bool,
+    message_count: int,
+    entry_count: int,
+    page: int,
+) -> None:
+    if _broadcast_fn is None:
+        return
+    await _broadcast_fn({
+        "type": "activity",
+        "conversation_id": conversation_id,
+        "label": label,
+        "active": active,
+        "source": "opencode-app-server",
+        "phase": "history_import",
+        "message_count": message_count,
+        "entry_count": entry_count,
+        "page": page,
+    })
+
+
 async def hydrate_transcript(
     session_id: str,
     conversation_id: str,
@@ -993,8 +1208,88 @@ async def hydrate_transcript(
     model: Optional[str] = None,
     settings: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
-    del session_id, conversation_id, cwd, model, settings
-    return []
+    del model
+    resolved_cwd = _cwd_from_settings(settings, cwd)
+    transport = await _ensure_transport_ready(resolved_cwd)
+    entries: List[Dict[str, object]] = []
+    cursor: Optional[Dict[str, object]] = None
+    imported_raw_messages: List[object] = []
+    imported_messages = 0
+    page = 0
+    await _broadcast_history_import_activity(
+        conversation_id=conversation_id,
+        label="importing history",
+        active=True,
+        message_count=0,
+        entry_count=0,
+        page=0,
+    )
+    failed = False
+    try:
+        while True:
+            page += 1
+            params: Dict[str, object] = {
+                "sessionId": session_id,
+                "limit": _HISTORY_IMPORT_PAGE_SIZE,
+                "order": "desc",
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await transport.rpc_request(
+                "session/messages",
+                params=params,
+                timeout=None,
+            )
+            raw_messages_value: object = result.get("messages")
+            if not isinstance(raw_messages_value, list):
+                raw_messages_value = result.get("data")
+            message_items: List[object] = (
+                list(cast(List[object], raw_messages_value))
+                if isinstance(raw_messages_value, list)
+                else []
+            )
+            if not message_items:
+                break
+            imported_raw_messages.extend(message_items)
+            imported_messages += len(message_items)
+            await _broadcast_history_import_activity(
+                conversation_id=conversation_id,
+                label=f"importing history ({imported_messages} messages)",
+                active=True,
+                message_count=imported_messages,
+                entry_count=0,
+                page=page,
+            )
+            result_cursor = _object_dict(result.get("cursor"))
+            next_cursor = _string_value(result_cursor.get("id"), result.get("nextCursor"))
+            if len(message_items) < _HISTORY_IMPORT_PAGE_SIZE or not next_cursor:
+                break
+            cursor = {"id": next_cursor, "direction": "previous"}
+        for raw_message in reversed(imported_raw_messages):
+            message = _object_dict(raw_message)
+            if message:
+                entries.extend(_history_message_entries(
+                    conversation_id=conversation_id,
+                    message=message,
+                ))
+    except Exception:
+        failed = True
+        raise
+    finally:
+        await _broadcast_history_import_activity(
+            conversation_id=conversation_id,
+            label="history import failed" if failed else "history imported",
+            active=False,
+            message_count=imported_messages,
+            entry_count=len(entries),
+            page=page,
+        )
+    _add_to_raw_buffer(
+        "out",
+        conversation_id,
+        f"hydrate_transcript imported={len(entries)} messages={imported_messages} session={session_id[:8]}",
+    )
+    return entries
 
 
 async def resolve_approval(request_id: str, resolution: object) -> bool:

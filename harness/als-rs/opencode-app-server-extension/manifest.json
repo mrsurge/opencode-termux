@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "compat": {
+    "app_server_manifest_min": 1,
+    "app_server_manifest_max": 1
+  },
+  "id": "opencode-app-server",
+  "name": "OpenCode App Server",
+  "version": "0.1.0",
+  "type": "opencode_app_server",
+  "description": "OpenCode route-backed app-server test harness over strict JSON-RPC stdio",
+  "enabled": true,
+  "agent": {
+    "command": "/data/data/com.termux/files/home/.bun/bin/bun",
+    "args": [
+      "run",
+      "--conditions=browser",
+      "/data/data/com.termux/files/home/test-projects/opencode/packages/opencode/src/index.ts",
+      "app-server"
+    ],
+    "shellspec": "shellspec/opencode_app_server.yaml#opencode_app_server_observed"
+  },
+  "capabilities": {
+    "sessionResume": true,
+    "streaming": true,
+    "modelListing": true,
+    "permissionHandling": true,
+    "live_session_request": true,
+    "collabAgents": false,
+    "hasPlan": false,
+    "hasTodo": false,
+    "hasPlanModes": false
+  },
+  "model": {
+    "name": "opencode-auto",
+    "provider": "opencode"
+  },
+  "ui": {
+    "icon": "opencode.svg",
+    "color": "#4285f4",
+    "semanticShellRibbon": {
+      "quoteParsing": true
+    },
+    "toolRenderPolicy": {
+      "default": {
+        "request": "plain",
+        "response": "plain"
+      }
+    },
+    "requestCards": [
+      {
+        "id": "opencode-app-server-approval",
+        "module": "ui/request_cards/opencode_app_server_request_card.js",
+        "export": "renderRequestCard",
+        "matches": [
+          {
+            "requestMethod": "turn/toolApprovalRequested"
+          },
+          {
+            "requestMethod": "turn/userInputRequested",
+            "kind": "user_input"
+          }
+        ]
+      }
+    ]
+  }
+}

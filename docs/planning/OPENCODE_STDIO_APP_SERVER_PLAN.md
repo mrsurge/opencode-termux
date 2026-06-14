@@ -64,6 +64,12 @@ Active tracker items:
 - [x] Keep `opencode app-server` out of legacy instance bootstrap.
 - [x] Implement `provider/list` through the V2 `Catalog.Service` in the
   requested location layer.
+- [ ] Fix provider/model listing when ALS creates a conversation without a
+  pre-selected directory. Current deferred bug: `provider/list` can receive a
+  literal `~` cwd and fail in OpenCode's location layer with
+  `ENOENT: no such file or directory, lstat '~'`. The later fix should normalize
+  cwd at the extension/app-server boundary, not add a silent provider-list
+  fallback.
 - [x] Implement `model/list` through the V2 `Catalog.Service` in the requested
   location layer.
 - [x] Implement `session/create` through the public native
@@ -118,6 +124,9 @@ Active tracker items:
 - [x] Update the copied ALS-RS OpenCode extension scaffold so the shellspec
   launches the local live-source `opencode-spike app-server` instead of the
   mock Python app-server.
+- [x] Pin the ALS app-server shellspec to `OPENCODE_DB=opencode-dev.db` so the
+  live-source app-server shares the compiled `opencode-spike-bin` CLI session
+  database instead of defaulting to the source channel's `opencode-local.db`.
 - [x] Keep `sessionName` as an ALS-local runtime slot in the extension adapter,
   while routing app-server RPC calls through the durable OpenCode `sessionId` /
   `providerSessionId` / `threadId` bind.
@@ -176,6 +185,17 @@ Active tracker items:
   `user_developer_instructions`. The extension normalizes those textareas into
   strict app-server instruction entries and sends `hostPlatform: "ALS"` on every
   create/resume/turn path.
+- [x] Expose OpenCode projected history through strict stdio RPC
+  `session/messages`, backed by the public native
+  `OpenCode.Service.sessions.messages(...)` facade.
+- [x] Implement ALS create-with-history / provider-session port-in hydration for
+  OpenCode. `resume_session_with_history()` binds the selected `ses_...`
+  provider id through read-only `session/status` validation. It must not call
+  `session/resume`, `turn/start`, or the lazy runtime-load path, because those
+  can drain queued OpenCode work and mutate imported CLI sessions.
+  `hydrate_transcript()` calls `session/messages` and converts OpenCode
+  projected user, assistant text, reasoning, shell, and basic tool messages into
+  normalized ALS transcript records for the generic import transaction path.
 - [ ] Map per-turn approval/sandbox policy to real OpenCode runtime semantics.
   Do not treat `approvalMode` / `sandbox` on `turn/start` as supported until a
   real OpenCode policy mapping exists.
@@ -193,6 +213,12 @@ Current validation:
   location-scoped instruction overlay. The full lifecycle file still has the
   older cancellation test failure through Effect's
   `All fibers interrupted without error` path.
+- Passed:
+  focused `bun test test/cli/app-server/lifecycle.test.ts --timeout 150000 --test-name-pattern "session messages"`,
+  package `bun typecheck`, extension `py_compile`, extension
+  `basedpyright --outputjson`, settings-schema JSON parsing, `git diff --check`,
+  and a direct `opencode-spike app-server` stdio probe that initialized,
+  created a fresh session, called `session/messages`, and shut down cleanly.
 - Passed:
   `bun test test/session-runner-model.test.ts --timeout 30000` from
   `packages/core`. The focused resolver tests now cover OpenAI OAuth route
@@ -293,14 +319,31 @@ Two local launchers are available for manual testing:
 - `opencode-spike`: live-source wrapper installed at
   `/data/data/com.termux/files/home/.local/share/opencode-appserver-spike/bin/opencode-spike`
   and symlinked at `/data/data/com.termux/files/home/.local/bin/opencode-spike`.
-  It runs:
+  For default TUI launches, the relevant wrapper shape is:
 
   ```sh
-  bun run --conditions=browser \
-    /data/data/com.termux/files/home/test-projects/open-gemini-cli-appserver-spike/worktrees/opencode/packages/opencode/src/index.ts "$@"
+  caller_cwd="$(pwd)"
+  export OPENCODE_DB="${OPENCODE_DB:-opencode-dev.db}"
+  cd /data/data/com.termux/files/home/test-projects/open-gemini-cli-appserver-spike/worktrees/opencode/packages/opencode
+
+  # Default TUI launch only; explicit project paths and subcommands are
+  # forwarded without injecting caller_cwd.
+  bun run --conditions=browser ./src/index.ts "$caller_cwd" "$@"
   ```
 
+  The package cwd is required so Bun loads `packages/opencode/bunfig.toml`
+  and preloads the OpenTUI Solid TSX transform. Running the absolute
+  `src/index.ts` from another cwd can make Bun import
+  `@opentui/solid/jsx-runtime.d.ts` as runtime code.
+  The wrapper injects the caller cwd only for default TUI launches; explicit
+  subcommands and explicit project paths are forwarded as-is. It also defaults
+  `OPENCODE_DB` to `opencode-dev.db` so the live-source launcher shares the
+  compiled `opencode-spike-bin` session database unless the caller explicitly
+  overrides the database.
+
   Use this while developing app-server code because it runs the active checkout.
+  The ALS extension also pins this launcher to `OPENCODE_DB=opencode-dev.db`
+  for storage parity with the compiled CLI snapshot.
 
 - `opencode-spike-bin`: compiled snapshot installed at
   `/data/data/com.termux/files/home/.local/share/opencode-appserver-spike/bin/opencode-spike-bin`
@@ -628,6 +671,11 @@ Source-pass refinement:
   real provider facade/catalog path. Required options such as stateless request
   mode, reasoning includes, service tier, and variant metadata must come from
   that route/model metadata, not from provider checks in the app-server runner.
+- Deferred bug: if ALS opens settings before a directory is selected, the
+  extension/app-server provider listing path can pass literal `~` as cwd, which
+  OpenCode rejects with `ENOENT: no such file or directory, lstat '~'`. This
+  should be fixed by explicit cwd normalization/validation at the boundary; do
+  not mask it with fallback provider data.
 
 ## Approval Mapping
 
@@ -708,11 +756,29 @@ permission policy mapping is understood.
 
 ### Slice 5: ALS-RS Adapter Port
 
-- Point the copied `opencode-app-server` ALS extension at the real app-server
+- [x] Point the copied `opencode-app-server` ALS extension at the real app-server
   entrypoint.
-- Replace the copied config-generator settings surface with flat provider,
+- [x] Replace the copied config-generator settings surface with flat provider,
   model, and reasoning-effort controls backed by OpenCode catalog RPC.
-- Validate settings schema, session binding, approvals, reasoning, tool events,
+- [x] Implement create-with-history provider-session import parity with the
+  built-in extensions: ALS binds the selected provider session id, calls
+  extension-owned `resume_session_with_history()`, and only runs transcript
+  hydration when the schema/history import flow requests it. For OpenCode,
+  `resume_session_with_history()` is read-only/bind-only and validates with
+  `session/status`; it must not wake provider execution.
+- [x] Add `session/messages` to the stdio app-server and use it from the ALS
+  extension's `hydrate_transcript()` converter.
+- [ ] Resolve CLI-session continuation compatibility for imported sessions whose
+  history contains user `files` attachments. Observed failure on
+  `ses_14186ea3effeXW7L2POYPTcl2P`: the fork hydrates over RPC, but a resumed
+  OpenAI Responses turn fails with `OpenAI Responses user media content only
+  supports images` because historical CLI `@file` mentions are projected as
+  `text/plain` user media.
+- [ ] Live-validate the schema session picker "create with history" flow through
+  ALS after install/reload.
+- [x] Install the updated ALS extension with `extension install --no-notify-server`;
+  live reload/validation remains the next manual step.
+- [ ] Validate settings schema, session binding, approvals, reasoning, tool events,
   diff cards, and terminal turn lifecycle through ALS.
 
 ### Slice 6: MCP Tool Bridge
@@ -805,6 +871,10 @@ ALS provides; it does not persist those side channels into conversation meta.
   Schema cleanly, or whether a separate Zod/Effect-schema bridge is needed.
 - Whether ALS wants a thin `sessionName` compatibility field for display only,
   even though OpenCode's real provider id is the durable `ses_...` id.
+- How OpenCode should lower historical CLI file attachments when continuing a
+  session through providers/protocols that reject non-image user media. The
+  current projection preserves those attachments as user files, which is correct
+  for transcript import but not necessarily valid provider input for every route.
 
 ## Current Scaffold
 

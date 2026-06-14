@@ -29,6 +29,7 @@ import { logFailure } from "./session/logging"
 import { MessageDecodeError } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
+import { SessionLegacyProjection } from "./session/legacy-projection"
 
 // get project -> project.locations
 //
@@ -295,6 +296,7 @@ export const layer = Layer.effect(
       }),
       messages: Effect.fn("V2Session.messages")(function* (input) {
         yield* result.get(input.sessionID)
+        yield* SessionLegacyProjection.ensure(db, input.sessionID)
         const direction = input.cursor?.direction ?? "next"
         const requestedOrder = input.order ?? "desc"
         const order = direction === "previous" ? (requestedOrder === "asc" ? "desc" : "asc") : requestedOrder
@@ -333,6 +335,7 @@ export const layer = Layer.effect(
       }),
       context: Effect.fn("V2Session.context")(function* (sessionID) {
         yield* result.get(sessionID)
+        yield* SessionLegacyProjection.ensure(db, sessionID)
         return yield* store.context(sessionID)
       }),
       events: (input) =>
@@ -349,6 +352,7 @@ export const layer = Layer.effect(
         Effect.uninterruptible(
           Effect.gen(function* () {
             yield* result.get(input.sessionID)
+            yield* SessionLegacyProjection.ensure(db, input.sessionID)
             const returnPrompt = Effect.fnUntraced(function* (admitted: SessionInput.Admitted) {
               if (input.resume !== false) yield* enqueueWake(admitted)
               return admitted
@@ -402,6 +406,7 @@ export const layer = Layer.effect(
       }),
       resume: Effect.fn("V2Session.resume")(function* (sessionID) {
         yield* result.get(sessionID)
+        yield* SessionLegacyProjection.ensure(db, sessionID)
         yield* execution.resume(sessionID)
       }),
       interrupt: Effect.fn("V2Session.interrupt")((sessionID) =>

@@ -1044,6 +1044,7 @@ class OpenCodeAppServerTransport:
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stdout_subscription: Optional[_OutputSubscription] = None
         self._initialized = False
+        self._capabilities: Dict[str, object] = {}
         self._request_counter = int(time.time() * 1000)
         self._rpc_waiters: Dict[str, asyncio.Future[Dict[str, object]]] = {}
         self._turn_waiters: Dict[str, asyncio.Future[Dict[str, object]]] = {}
@@ -1178,6 +1179,7 @@ class OpenCodeAppServerTransport:
             shell_id = self._shell_id
             self._shell_id = None
             self._initialized = False
+            self._capabilities = {}
             self._active_sessions.clear()
             self._session_conversations.clear()
             self._pending_approval_requests.clear()
@@ -1218,8 +1220,7 @@ class OpenCodeAppServerTransport:
         params["approvalMode"] = _app_server_approval_mode(approval_policy)
         if sandbox is not None:
             params["sandbox"] = sandbox
-        if mcp_servers is not None:
-            params["mcpServers"] = mcp_servers
+        self._add_mcp_servers_param(params, mcp_servers)
         result = await self.rpc_request(
             "session/create",
             params=params,
@@ -1270,8 +1271,7 @@ class OpenCodeAppServerTransport:
         params["approvalMode"] = _app_server_approval_mode(approval_policy)
         if sandbox is not None:
             params["sandbox"] = sandbox
-        if mcp_servers is not None:
-            params["mcpServers"] = mcp_servers
+        self._add_mcp_servers_param(params, mcp_servers)
         if session_hydrate:
             params["sessionHydrate"] = session_hydrate
         result = await self.rpc_request("session/resume", params=params, timeout=20.0)
@@ -1391,8 +1391,7 @@ class OpenCodeAppServerTransport:
                 params["reasoningEffort"] = reasoning_effort
             if instructions:
                 params.update(instructions)
-            if mcp_servers is not None:
-                params["mcpServers"] = mcp_servers
+            self._add_mcp_servers_param(params, mcp_servers)
             accepted = await self.rpc_request(
                 "turn/start",
                 params=params,
@@ -1432,7 +1431,7 @@ class OpenCodeAppServerTransport:
         method: str,
         *,
         params: Optional[Dict[str, object]] = None,
-        timeout: float = 10.0,
+        timeout: Optional[float] = 10.0,
         conversation_id: Optional[str] = None,
     ) -> Dict[str, object]:
         req_id = self._next_request_id()
@@ -1443,7 +1442,7 @@ class OpenCodeAppServerTransport:
             payload["params"] = params
         await self._write_payload(payload, conversation_id=conversation_id)
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
+            response = await future if timeout is None else await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._rpc_waiters.pop(req_id, None)
         if response.get("error"):
@@ -1568,12 +1567,24 @@ class OpenCodeAppServerTransport:
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
-        await self.rpc_request(
+        result = await self.rpc_request(
             "server/initialize",
             params={"clientName": "als-rs-opencode-extension", "clientVersion": "0.1.0"},
             timeout=10.0,
         )
+        self._capabilities = _object_dict(result.get("capabilities"))
         self._initialized = True
+
+    def _add_mcp_servers_param(
+        self,
+        params: Dict[str, object],
+        mcp_servers: Optional[Dict[str, object]],
+    ) -> None:
+        if mcp_servers is None:
+            return
+        if self._capabilities.get("mcp") is not True:
+            raise RuntimeError("OpenCode app-server does not advertise MCP support")
+        params["mcpServers"] = mcp_servers
 
     async def _write_payload(
         self,
