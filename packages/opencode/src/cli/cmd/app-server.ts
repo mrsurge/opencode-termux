@@ -59,7 +59,7 @@ type ServerInitializeResult = {
     readonly providers: true
     readonly approvals: true
     readonly userInput: true
-    readonly mcp: false
+    readonly mcp: true
   }
 }
 
@@ -371,7 +371,7 @@ type AppServerServices = {
   readonly getSessionStatus: (params: SessionStatusParams) => Promise<SessionStatusResult>
   readonly resumeSession: (params: SessionResumeParams) => Promise<SessionResumeResult>
   readonly startTurn: (params: TurnStartParams, emit: NotificationEmitter) => Promise<TurnStartResult>
-  readonly cancelTurn: (params: TurnCancelParams) => Promise<TurnCancelResult>
+  readonly cancelTurn: (params: TurnCancelParams, emit: NotificationEmitter) => Promise<TurnCancelResult>
   readonly respondToolApproval: (params: ToolApprovalRespondParams) => Promise<ToolApprovalRespondResult>
   readonly respondUserInput: (params: UserInputRespondParams) => Promise<UserInputRespondResult>
   readonly rejectUserInput: (params: UserInputRejectParams) => Promise<UserInputRejectResult>
@@ -393,7 +393,32 @@ export type ActiveTurn = {
   readonly cleanup?: NotificationCleanup
 }
 
+type QueuedTurn = {
+  readonly active: ActiveTurn
+  readonly session: RouteSession
+  readonly messageId: string
+  readonly prompt: string
+  readonly selectedModel?: RouteModelSelection
+  readonly system?: string
+}
+
 type RouteClient = ReturnType<typeof createOpencodeClient>
+type RouteMcpConfig =
+  | {
+      readonly type: "local"
+      readonly command: string[]
+      readonly environment?: Record<string, string>
+      readonly enabled?: boolean
+      readonly timeout?: number
+    }
+  | {
+      readonly type: "remote"
+      readonly url: string
+      readonly headers?: Record<string, string>
+      readonly oauth?: false
+      readonly enabled?: boolean
+      readonly timeout?: number
+    }
 
 type RouteSession = {
   readonly id: string
@@ -478,12 +503,14 @@ export const AppServerCommand = effectCmd({
     routeConsoleToStderr()
     const routeClient = createRouteClient()
     const activeTurns = new Map<string, ActiveTurn>()
+    const queuedTurns = new Map<string, QueuedTurn[]>()
     const eventControllers = new Map<string, AbortController>()
+    const appliedMcpServers = new Map<string, Set<string>>()
     const ensureEventLoop = (cwd: string, emit: NotificationEmitter) => {
       if (eventControllers.has(cwd)) return
       const controller = new AbortController()
       eventControllers.set(cwd, controller)
-      void routeEventLoop(routeClient, cwd, controller.signal, activeTurns, emit)
+      void routeEventLoop(routeClient, cwd, controller.signal, activeTurns, queuedTurns, emit)
         .catch((cause) => {
           if (!controller.signal.aborted) console.error(errorDetails("event.subscribe", cause).message)
         })
@@ -497,6 +524,7 @@ export const AppServerCommand = effectCmd({
       }
       eventControllers.clear()
       await cleanupAllActiveTurns(activeTurns)
+      await cleanupAllQueuedTurns(queuedTurns)
     }
     yield* Effect.promise(() =>
       runAppServer({
@@ -513,12 +541,12 @@ export const AppServerCommand = effectCmd({
             params,
           ),
         createSession: async (params) => {
-          assertRouteSupportedParams(params)
           const cwd = resolveCwd(params.cwd)
           const selectedModel = routeModelSelection(params)
           if (selectedModel) {
             routeRequireModelSelection(await routeProviderCatalog(routeClient, cwd), selectedModel)
           }
+          await routeApplyMcpServers(routeClient, cwd, params.mcpServers, appliedMcpServers)
           const session = params.sessionId
             ? await routeData<RouteSession>(
                 "session.get",
@@ -556,25 +584,20 @@ export const AppServerCommand = effectCmd({
             }),
           ),
         resumeSession: async (params) => {
-          assertRouteSupportedParams(params)
           const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
             notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
           })
+          await routeApplyMcpServers(routeClient, session.directory, params.mcpServers, appliedMcpServers)
           return routeSessionResumeResult(session)
         },
         startTurn: async (params, emit) => {
-          assertRouteSupportedParams(params)
-          if (params.delivery === "queue") {
-            throw new AppServerError(-32602, "turn/start delivery=queue is not supported by the HTTP route.")
-          }
           const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
             notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
           })
-          if (activeTurns.has(session.id)) {
-            throw new AppServerError(-32020, `Session already has an active turn: ${session.id}`)
-          }
+          await routeApplyMcpServers(routeClient, session.directory, params.mcpServers, appliedMcpServers)
           ensureEventLoop(session.directory, emit)
           const turnId = params.turnId ?? randomUUID()
+          const messageId = params.messageId ?? Identifier.ascending("message")
           const selectedModel = routeModelSelection(params) ?? routeSessionModelSelection(session)
           const providerCatalog = selectedModel ? await routeProviderCatalog(routeClient, session.directory) : undefined
           if (selectedModel && providerCatalog) routeRequireModelSelection(providerCatalog, selectedModel)
@@ -591,23 +614,29 @@ export const AppServerCommand = effectCmd({
               ? { contextWindow: routeModelContextWindow(providerCatalog, selectedModel) }
               : {}),
           }
-          activeTurns.set(session.id, active)
+          const system = routeSystemPrompt(params, selectedModel)
+          const queued: QueuedTurn = {
+            active,
+            session,
+            messageId,
+            prompt: params.prompt,
+            ...(selectedModel ? { selectedModel } : {}),
+            ...(system ? { system } : {}),
+          }
+          if (activeTurns.has(session.id) || routeQueuedTurns(queuedTurns, session.id).length > 0) {
+            routeEnqueueTurn(queuedTurns, queued)
+            return {
+              accepted: true,
+              turnId,
+              sessionId: session.id,
+              providerSessionId: session.id,
+              threadId: session.id,
+              messageId,
+              delivery: "queue",
+            }
+          }
           try {
-            const system = routeSystemPrompt(params, selectedModel)
-            const messageId = params.messageId ?? Identifier.ascending("message")
-            await routeVoid(
-              "session.prompt_async",
-              routeClient.session.promptAsync({
-                sessionID: session.id,
-                directory: session.directory,
-                messageID: messageId,
-                ...(selectedModel ? { model: { providerID: selectedModel.providerID, modelID: selectedModel.modelID } } : {}),
-                ...(selectedModel?.variant ? { variant: selectedModel.variant } : {}),
-                ...(system ? { system } : {}),
-                parts: [{ type: "text", text: params.prompt }],
-              }),
-              { notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`) },
-            )
+            await routeSubmitTurn(routeClient, activeTurns, queued)
             return {
               accepted: true,
               turnId,
@@ -622,15 +651,38 @@ export const AppServerCommand = effectCmd({
             throw cause
           }
         },
-        cancelTurn: async (params) => {
+        cancelTurn: async (params, emit) => {
           const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
             notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
           })
           const active = activeTurns.get(session.id)
-          if (params.turnId && active && params.turnId !== active.turnId) {
-            throw new AppServerError(-32020, `Session has a different active turn: ${session.id}`)
+          const queued = params.turnId ? routeFindQueuedTurn(queuedTurns, session.id, params.turnId) : undefined
+          if (params.turnId && active?.turnId !== params.turnId && !queued) {
+            throw new AppServerError(-32020, `Session has no active or queued turn: ${session.id}`)
+          }
+          if (queued && active?.turnId !== params.turnId) {
+            routeRemoveQueuedTurn(queuedTurns, session.id, queued.active.turnId)
+            emit("turn/completed", {
+              ...turnBase(queued.active),
+              status: "cancelled",
+              content: "",
+              reasoning: "",
+            })
+            await queued.active.cleanup?.()
+            return routeTurnCancelResult(session, queued.active)
           }
           if (active) active.cancelRequested = true
+          if (!params.turnId) {
+            for (const item of routeClearQueuedTurns(queuedTurns, session.id)) {
+              emit("turn/completed", {
+                ...turnBase(item.active),
+                status: "cancelled",
+                content: "",
+                reasoning: "",
+              })
+              await item.active.cleanup?.()
+            }
+          }
           await routeData("session.abort", routeClient.session.abort({ sessionID: session.id, directory: session.directory }), {
             notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
           })
@@ -737,17 +789,70 @@ function routeError(method: string, value: unknown, options: { readonly notFound
   return new AppServerError(-32603, `${method} failed: ${message}`)
 }
 
-function assertRouteSupportedParams(params: McpParams) {
-  if (params.mcpServers !== undefined) {
-    throw new AppServerError(-32602, "mcpServers are not supported by the HTTP route-backed app-server yet.")
-  }
-}
-
 async function routeProviderCatalog(client: RouteClient, cwd: string | undefined): Promise<RouteProviderList> {
   const directory = routeDirectory(cwd)
   const source = await routeData<RouteProviderList>("provider.list", client.provider.list(directory))
   const configured = await routeData<RouteConfigProviderList>("config.providers", client.config.providers(directory))
   return routeMergeProviderCatalog(source, configured)
+}
+
+async function routeApplyMcpServers(
+  client: RouteClient,
+  cwd: string,
+  servers: Record<string, McpServerConfig> | undefined,
+  applied: Map<string, Set<string>>,
+) {
+  if (servers === undefined) return
+  const directory = resolveCwd(cwd)
+  const previous = applied.get(directory) ?? new Set<string>()
+  const next = new Set(Object.keys(servers))
+  for (const name of previous) {
+    if (next.has(name)) continue
+    await routeVoid("mcp.disconnect", client.mcp.disconnect({ name, directory }), {
+      notFound: new AppServerError(-32060, `MCP server not found while disconnecting: ${name}`),
+    })
+  }
+  for (const [name, server] of Object.entries(servers)) {
+    const disabled = server.disabled === true
+    const status = await routeData<Record<string, unknown>>(
+      "mcp.add",
+      client.mcp.add({
+        directory,
+        name,
+        config: routeMcpConfig(server),
+      }),
+    )
+    routeRequireMcpStatus(name, status[name], disabled)
+  }
+  applied.set(directory, next)
+}
+
+function routeMcpConfig(server: McpServerConfig): RouteMcpConfig {
+  if (server.type === "local") {
+    return {
+      type: "local",
+      command: [...server.command],
+      ...(server.environment ? { environment: server.environment } : {}),
+      ...(server.disabled === undefined ? {} : { enabled: !server.disabled }),
+      ...(server.timeout === undefined ? {} : { timeout: server.timeout }),
+    }
+  }
+  return {
+    type: "remote",
+    url: server.url,
+    ...(server.headers ? { headers: server.headers } : {}),
+    ...(server.disabled === undefined ? {} : { enabled: !server.disabled }),
+    ...(server.timeout === undefined ? {} : { timeout: server.timeout }),
+  }
+}
+
+function routeRequireMcpStatus(name: string, value: unknown, disabled: boolean) {
+  const status = record(value)
+  const kind = stringValue(status.status)
+  if (disabled && kind === "disabled") return
+  if (!disabled && kind === "connected") return
+  const message = stringValue(status.error) ?? `MCP server ${name} did not connect; status=${kind ?? "unknown"}`
+  throw new AppServerError(-32060, message)
 }
 
 function routeMergeProviderCatalog(source: RouteProviderList, configured: RouteConfigProviderList): RouteProviderList {
@@ -944,6 +1049,7 @@ async function routeEventLoop(
   cwd: string,
   signal: AbortSignal,
   activeTurns: Map<string, ActiveTurn>,
+  queuedTurns: Map<string, QueuedTurn[]>,
   emit: NotificationEmitter,
 ) {
   const events = await client.event.subscribe(
@@ -955,9 +1061,67 @@ async function routeEventLoop(
   )
   for await (const event of events.stream) {
     emit("opencode/event", routeEventEnvelope(cwd, event))
-    for (const item of routeTurnNotifications(activeTurns, event)) {
+    const notifications = routeTurnNotifications(activeTurns, event)
+    for (const item of notifications) {
       emit(item.method, item.params)
     }
+    for (const item of notifications.filter((entry) => entry.method === "turn/completed")) {
+      const sessionId = stringValue(item.params.sessionId)
+      if (sessionId) await routeStartNextQueuedTurn(client, activeTurns, queuedTurns, sessionId, emit)
+    }
+  }
+}
+
+async function routeSubmitTurn(
+  client: RouteClient,
+  activeTurns: Map<string, ActiveTurn>,
+  queued: QueuedTurn,
+) {
+  activeTurns.set(queued.session.id, queued.active)
+  try {
+    await routeVoid(
+      "session.prompt_async",
+      client.session.promptAsync({
+        sessionID: queued.session.id,
+        directory: queued.session.directory,
+        messageID: queued.messageId,
+        ...(queued.selectedModel ? { model: { providerID: queued.selectedModel.providerID, modelID: queued.selectedModel.modelID } } : {}),
+        ...(queued.selectedModel?.variant ? { variant: queued.selectedModel.variant } : {}),
+        ...(queued.system ? { system: queued.system } : {}),
+        parts: [{ type: "text", text: queued.prompt }],
+      }),
+      { notFound: new AppServerError(-32010, `Session not found: ${queued.session.id}`) },
+    )
+  } catch (cause) {
+    await cleanupActiveTurn(activeTurns, queued.session.id)
+    throw cause
+  }
+}
+
+async function routeStartNextQueuedTurn(
+  client: RouteClient,
+  activeTurns: Map<string, ActiveTurn>,
+  queuedTurns: Map<string, QueuedTurn[]>,
+  sessionId: string,
+  emit: NotificationEmitter,
+) {
+  if (activeTurns.has(sessionId)) return
+  const queued = routeDequeueTurn(queuedTurns, sessionId)
+  if (!queued) return
+  try {
+    await routeSubmitTurn(client, activeTurns, queued)
+  } catch (cause) {
+    const details = errorDetails("session.prompt_async", cause)
+    const eventError = { type: "unknown", message: details.message, data: details.data }
+    emit("turn/error", { ...turnBase(queued.active), error: eventError })
+    emit("turn/completed", {
+      ...turnBase(queued.active),
+      status: "failed",
+      content: queued.active.content.join(""),
+      reasoning: queued.active.reasoning.join(""),
+      error: eventError,
+    })
+    await routeStartNextQueuedTurn(client, activeTurns, queuedTurns, sessionId, emit)
   }
 }
 
@@ -1503,7 +1667,7 @@ export async function handleLine(
   if (request.method === "turn/cancel") {
     const params = turnCancelParams(request.params)
     if (!params) return { response: error(id.value, -32602, "Invalid params") }
-    return handleAsync(id.value, request.method, () => services.cancelTurn(params))
+    return handleAsync(id.value, request.method, () => services.cancelTurn(params, emit))
   }
 
   if (request.method === "turn/toolApproval/respond") {
@@ -1902,7 +2066,7 @@ function initializeResult(): ServerInitializeResult {
       providers: true,
       approvals: true,
       userInput: true,
-      mcp: false,
+      mcp: true,
     },
   }
 }
@@ -1955,6 +2119,45 @@ async function cleanupActiveTurn(activeTurns: Map<string, ActiveTurn>, sessionId
 
 async function cleanupAllActiveTurns(activeTurns: Map<string, ActiveTurn>) {
   await Promise.all([...activeTurns.keys()].map((sessionId) => cleanupActiveTurn(activeTurns, sessionId)))
+}
+
+function routeQueuedTurns(queuedTurns: Map<string, QueuedTurn[]>, sessionId: string) {
+  return queuedTurns.get(sessionId) ?? []
+}
+
+function routeEnqueueTurn(queuedTurns: Map<string, QueuedTurn[]>, queued: QueuedTurn) {
+  queuedTurns.set(queued.session.id, [...routeQueuedTurns(queuedTurns, queued.session.id), queued])
+}
+
+function routeDequeueTurn(queuedTurns: Map<string, QueuedTurn[]>, sessionId: string) {
+  const current = routeQueuedTurns(queuedTurns, sessionId)
+  const queued = current[0]
+  const next = current.slice(1)
+  if (next.length > 0) queuedTurns.set(sessionId, next)
+  else queuedTurns.delete(sessionId)
+  return queued
+}
+
+function routeFindQueuedTurn(queuedTurns: Map<string, QueuedTurn[]>, sessionId: string, turnId: string) {
+  return routeQueuedTurns(queuedTurns, sessionId).find((queued) => queued.active.turnId === turnId)
+}
+
+function routeRemoveQueuedTurn(queuedTurns: Map<string, QueuedTurn[]>, sessionId: string, turnId: string) {
+  const next = routeQueuedTurns(queuedTurns, sessionId).filter((queued) => queued.active.turnId !== turnId)
+  if (next.length > 0) queuedTurns.set(sessionId, next)
+  else queuedTurns.delete(sessionId)
+}
+
+function routeClearQueuedTurns(queuedTurns: Map<string, QueuedTurn[]>, sessionId: string) {
+  const current = routeQueuedTurns(queuedTurns, sessionId)
+  queuedTurns.delete(sessionId)
+  return current
+}
+
+async function cleanupAllQueuedTurns(queuedTurns: Map<string, QueuedTurn[]>) {
+  const current = [...queuedTurns.values()].flat()
+  queuedTurns.clear()
+  await Promise.all(current.map((queued) => queued.active.cleanup?.()))
 }
 
 function turnBase(turn: ActiveTurn) {

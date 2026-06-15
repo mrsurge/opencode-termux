@@ -65,7 +65,7 @@ describe("opencode app-server subprocess", () => {
               providers: true,
               approvals: true,
               userInput: true,
-              mcp: false,
+              mcp: true,
             },
           },
         })
@@ -119,7 +119,19 @@ describe("opencode app-server subprocess", () => {
           jsonrpc: "2.0",
           id: 4,
           method: "session/create",
-          params: { cwd: home, provider: "test", model: "test-model", reasoningEffort: "high" },
+          params: {
+            cwd: home,
+            provider: "test",
+            model: "test-model",
+            reasoningEffort: "high",
+            mcpServers: {
+              "app-server-disabled": {
+                type: "local",
+                command: ["echo", "disabled"],
+                disabled: true,
+              },
+            },
+          },
         })
         const created = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(30)))
         expect(created).toMatchObject({
@@ -769,14 +781,76 @@ describe("opencode app-server cancellation", () => {
           }),
         )
 
-        yield* appServer.send({ jsonrpc: "2.0", id: 8, method: "server/shutdown" })
-        const shutdownMessages = yield* receiveUntil(appServer, (messages) =>
-          messages.some((message) => isResponse(message, 8)),
-        )
-        const shutdown = responseWithId(shutdownMessages, 8)
-        expect(shutdown).toEqual({
+        yield* llm.reset
+        let releaseQueuedFirst!: () => void
+        const queuedFirst = new Promise<void>((resolve) => {
+          releaseQueuedFirst = resolve
+        })
+        yield* llm.hold("queued first ok", queuedFirst)
+        yield* appServer.send({
           jsonrpc: "2.0",
           id: 8,
+          method: "turn/start",
+          params: { sessionId: sessionResult.sessionId, prompt: "hold first queued test turn" },
+        })
+        const firstQueuedMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 8)),
+        )
+        const firstQueuedResponse = objectRecord(objectRecord(responseWithId(firstQueuedMessages, 8))?.result)
+        if (!firstQueuedResponse) throw new Error("first queued test turn did not return a result")
+        const firstQueuedTurnId = stringField(firstQueuedResponse, "turnId")
+        if (!firstQueuedTurnId) throw new Error("first queued test turn did not return a turn id")
+
+        yield* llm.text("queued second ok")
+        yield* appServer.send({
+          jsonrpc: "2.0",
+          id: 9,
+          method: "turn/start",
+          params: { sessionId: sessionResult.sessionId, prompt: "run after first queued test turn" },
+        })
+        const secondQueuedMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 9)),
+        )
+        const secondQueuedResponse = objectRecord(objectRecord(responseWithId(secondQueuedMessages, 9))?.result)
+        if (!secondQueuedResponse) throw new Error("second queued test turn did not return a result")
+        const secondQueuedTurnId = stringField(secondQueuedResponse, "turnId")
+        if (!secondQueuedTurnId) throw new Error("second queued test turn did not return a turn id")
+        expect(secondQueuedResponse).toMatchObject({
+          accepted: true,
+          delivery: "queue",
+        })
+
+        releaseQueuedFirst()
+        const queuedTurnMessages = yield* receiveUntil(appServer, (messages) => {
+          const completed = notificationParamList(messages, "turn/completed")
+          return (
+            completed.some((message) => stringField(message, "turnId") === firstQueuedTurnId) &&
+            completed.some((message) => stringField(message, "turnId") === secondQueuedTurnId)
+          )
+        })
+        expect(notificationParamList(queuedTurnMessages, "turn/completed")).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              turnId: firstQueuedTurnId,
+              status: "completed",
+              content: "queued first ok",
+            }),
+            expect.objectContaining({
+              turnId: secondQueuedTurnId,
+              status: "completed",
+              content: "queued second ok",
+            }),
+          ]),
+        )
+
+        yield* appServer.send({ jsonrpc: "2.0", id: 10, method: "server/shutdown" })
+        const shutdownMessages = yield* receiveUntil(appServer, (messages) =>
+          messages.some((message) => isResponse(message, 10)),
+        )
+        const shutdown = responseWithId(shutdownMessages, 10)
+        expect(shutdown).toEqual({
+          jsonrpc: "2.0",
+          id: 10,
           result: { ok: true },
         })
 

@@ -36,8 +36,10 @@ READ_VIEW_TOOLS = {"read", "read_file"}
 COMMAND_TOOLS = {"bash"}
 SEARCH_TOOLS = {"grep"}
 USER_INPUT_TOOLS = {"question"}
+TODO_TOOLS = {"todowrite"}
 USER_INPUT_REQUEST_METHOD = "turn/userInputRequested"
-SPECIALIZED_TOOL_CARDS = PATCH_STYLE_TOOLS | READ_VIEW_TOOLS | COMMAND_TOOLS | SEARCH_TOOLS | USER_INPUT_TOOLS
+SPECIALIZED_TOOL_CARDS = PATCH_STYLE_TOOLS | READ_VIEW_TOOLS | COMMAND_TOOLS | SEARCH_TOOLS | USER_INPUT_TOOLS | TODO_TOOLS
+MCP_TOOL_PREFIXES = ("te2-mcp_", "agent-pty-blocks_")
 
 
 class OpenCodeAppServerRpcError(RuntimeError):
@@ -240,6 +242,8 @@ def _turn_usage(params: Dict[str, object]) -> Dict[str, object]:
 
     result: Dict[str, object] = {"total": int(context_used if context_used is not None else total or 0)}
     if input_tokens is not None:
+        result["active_context"] = int(input_tokens)
+    if input_tokens is not None:
         result["input_tokens"] = int(input_tokens)
     if output_tokens is not None:
         result["output_tokens"] = int(output_tokens)
@@ -258,6 +262,14 @@ def _turn_usage(params: Dict[str, object]) -> Dict[str, object]:
     if context_used is not None and context_window and context_window > 0:
         result["context_percent"] = context_used / context_window
     return result
+
+
+def _tool_identity(tool_name: str) -> tuple[str, str]:
+    normalized = tool_name.strip()
+    for prefix in MCP_TOOL_PREFIXES:
+        if normalized.startswith(prefix):
+            return prefix[:-1], normalized[len(prefix):]
+    return "", normalized or "tool"
 
 
 def _result_value(result: object) -> object:
@@ -308,6 +320,15 @@ def _diff_with_headers(
         f"+++ {new_header}\n"
         f"{diff_text}\n"
     )
+
+
+def _strip_diff_index_prelude(diff: str) -> str:
+    lines = diff.strip("\n").splitlines()
+    if len(lines) >= 2 and lines[0].startswith("Index: ") and set(lines[1]) == {"="}:
+        lines = lines[2:]
+    if not lines:
+        return ""
+    return "\n".join(lines).strip("\n") + "\n"
 
 
 def _unified_diff_from_strings(*, path: str, old: str, new: str) -> str:
@@ -438,6 +459,7 @@ def _file_change_payload(
     operation: str = "",
     target: str = "",
 ) -> Dict[str, object]:
+    visible_diff = _strip_diff_index_prelude(diff)
     diff_id = (
         f"{tool_call_id}:diff"
         if tool_call_id and index == 0
@@ -445,7 +467,7 @@ def _file_change_payload(
     )
     payload: Dict[str, object] = {
         "id": diff_id,
-        "text": diff,
+        "text": visible_diff,
         "path": path,
         "tool": tool,
         "source_tool": source_tool,
@@ -456,7 +478,7 @@ def _file_change_payload(
         payload["operation"] = operation
     if target:
         payload["target"] = target
-    line = _diff_first_hunk_line(diff, deleted_file=operation == "delete")
+    line = _diff_first_hunk_line(visible_diff, deleted_file=operation == "delete")
     if line is not None:
         payload["line"] = line
     return payload
@@ -739,6 +761,58 @@ def _tool_search_result(
         "partial": structured_dict.get("partial") is True,
         "item_count": item_count,
     }
+
+
+def _normalize_plan_status(value: object) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"in_progress", "pending", "completed"}:
+        return normalized
+    if normalized in {"done", "complete", "success", "succeeded"}:
+        return "completed"
+    if normalized in {"active", "running", "started"}:
+        return "in_progress"
+    return "pending"
+
+
+def _tool_plan_steps(*, tool_name: str, structured: object) -> List[Dict[str, object]]:
+    normalized_tool = tool_name.strip().lower()
+    if normalized_tool not in TODO_TOOLS:
+        return []
+    raw_todos = _object_dict(structured).get("todos")
+    if not isinstance(raw_todos, list):
+        return []
+    steps: List[Dict[str, object]] = []
+    for item in cast(List[object], raw_todos):
+        todo = _object_dict(item)
+        content = _optional_str(todo.get("content"))
+        if not content:
+            continue
+        step: Dict[str, object] = {
+            "step": content,
+            "status": _normalize_plan_status(todo.get("status")),
+        }
+        priority = _optional_str(todo.get("priority"))
+        if priority:
+            step["priority"] = priority
+        steps.append(step)
+    return steps
+
+
+def _plan_signature(steps: List[Dict[str, object]]) -> str:
+    return json.dumps(steps, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _plan_steps_markdown(steps: List[Dict[str, object]]) -> str:
+    rows: List[str] = []
+    for step in steps:
+        text = str(step.get("step") or "").strip()
+        if not text:
+            continue
+        status = str(step.get("status") or "pending")
+        marker = "x" if status == "completed" else " "
+        suffix = " _(in progress)_" if status == "in_progress" else ""
+        rows.append(f"- [{marker}] {text}{suffix}")
+    return "\n".join(rows)
 
 
 def _tool_read_view(
@@ -1101,6 +1175,8 @@ class OpenCodeAppServerTransport:
         self._turn_active_reasoning_keys: Dict[str, str] = {}
         self._turn_reasoning_next_indexes: Dict[str, int] = {}
         self._turn_finalized_reasoning_keys: set[str] = set()
+        self._turn_plan_steps: Dict[str, List[Dict[str, object]]] = {}
+        self._turn_plan_signatures: Dict[str, str] = {}
         self._turn_tool_requests: Dict[str, Dict[str, object]] = {}
         self._pending_approval_requests: Dict[str, Dict[str, object]] = {}
         self._active_sessions: Dict[str, Dict[str, object]] = {}
@@ -1407,6 +1483,8 @@ class OpenCodeAppServerTransport:
         self._turn_reasoning_buffers[turn_id] = {}
         self._turn_active_reasoning_keys.pop(turn_id, None)
         self._turn_reasoning_next_indexes[turn_id] = 0
+        self._turn_plan_steps.pop(turn_id, None)
+        self._turn_plan_signatures.pop(turn_id, None)
         keep_turn_state = False
         try:
             provider_session_id = _provider_session_id(session)
@@ -1784,6 +1862,15 @@ class OpenCodeAppServerTransport:
                     params=params,
                 )
             return
+        if method == "turn/usage" and turn_id:
+            usage = _turn_usage(params)
+            if conversation_id and usage:
+                await self._fanout_token_count(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    usage=usage,
+                )
+            return
         if method == "turn/completed" and turn_id:
             if conversation_id:
                 await self._fanout_reasoning(
@@ -1886,6 +1973,10 @@ class OpenCodeAppServerTransport:
                 turn_id=turn_id,
                 usage=usage,
             )
+        await self._fanout_final_plan(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
         await self._broadcast_fn({
             "type": "status",
             "conversation_id": conversation_id,
@@ -2181,14 +2272,17 @@ class OpenCodeAppServerTransport:
         tool_call_id = str(params.get("toolCallId") or "")
         if not tool_call_id:
             return
-        tool_name = str(params.get("toolName") or params.get("tool") or "tool")
+        source_tool_name = str(params.get("toolName") or params.get("tool") or "tool")
+        server_name, tool_name = _tool_identity(source_tool_name)
         arguments = _object_dict(params.get("arguments"))
         if not arguments:
             arguments = _object_dict(params.get("input"))
-        request_payload = build_tool_card_request("", tool_name, arguments)
+        request_payload = build_tool_card_request(server_name, tool_name, arguments)
         self._turn_tool_requests[tool_call_id] = {
             "turn_id": turn_id,
             "tool": tool_name,
+            "server": server_name,
+            "source_tool": source_tool_name,
             "raw_arguments": dict(arguments),
             "arguments": dict(arguments),
             "request": request_payload,
@@ -2201,6 +2295,8 @@ class OpenCodeAppServerTransport:
             "id": tool_call_id,
             "turn_id": turn_id,
             "tool": tool_name,
+            **({"server": server_name} if server_name else {}),
+            **({"source_tool": source_tool_name} if source_tool_name != tool_name else {}),
             "arguments": dict(arguments),
             "request": request_payload,
         })
@@ -2217,7 +2313,8 @@ class OpenCodeAppServerTransport:
             return
         session_name = str(params.get("sessionName") or self._turn_session_names.get(turn_id) or "")
         tool_call_id = str(params.get("toolCallId") or "")
-        tool_name = str(params.get("toolName") or params.get("tool") or params.get("action") or "tool")
+        source_tool_name = str(params.get("toolName") or params.get("tool") or params.get("action") or "tool")
+        server_name, tool_name = _tool_identity(source_tool_name)
         details: Dict[str, object] = _object_dict(params.get("details"))
         if not details:
             resources = params.get("resources")
@@ -2243,6 +2340,8 @@ class OpenCodeAppServerTransport:
             "approval_id": approval_id,
             "tool_call_id": tool_call_id,
             "tool": tool_name,
+            "server": server_name,
+            "source_tool": source_tool_name,
             "kind": kind,
         }
         event: Dict[str, object] = {
@@ -2398,14 +2497,19 @@ class OpenCodeAppServerTransport:
         if not tool_call_id:
             return
         prior = _object_dict(self._turn_tool_requests.pop(tool_call_id, {}))
-        tool_name = str(params.get("toolName") or params.get("tool") or prior.get("tool") or "tool")
+        source_tool_name = str(params.get("toolName") or params.get("tool") or prior.get("source_tool") or prior.get("tool") or "tool")
+        server_name, tool_name = _tool_identity(source_tool_name)
+        if not server_name:
+            server_name = _optional_str(prior.get("server")) or ""
+        if not tool_name:
+            tool_name = str(prior.get("tool") or "tool")
         raw_arguments = _object_dict(prior.get("raw_arguments"))
         if not raw_arguments:
             raw_arguments = _object_dict(prior.get("arguments"))
         arguments = _object_dict(prior.get("arguments")) or dict(raw_arguments)
         request_payload = prior.get("request")
         if request_payload is None:
-            request_payload = build_tool_card_request("", tool_name, arguments)
+            request_payload = build_tool_card_request(server_name, tool_name, arguments)
         result = params.get("result")
         error = params.get("error")
         status = str(params.get("status") or "completed")
@@ -2461,6 +2565,18 @@ class OpenCodeAppServerTransport:
                 search_result=search_result,
             )
             return
+        plan_steps = [] if is_error else _tool_plan_steps(
+            tool_name=tool_name,
+            structured=params.get("structured"),
+        )
+        if plan_steps:
+            await self._fanout_plan_update(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                steps=plan_steps,
+            )
+            return
         first_file_change = file_changes[0] if file_changes else {}
         card_tool_name = str(first_file_change.get("tool") or tool_name)
         arguments = _tool_display_arguments(
@@ -2468,19 +2584,21 @@ class OpenCodeAppServerTransport:
             arguments=raw_arguments,
             file_changes=file_changes,
         )
-        request_payload = build_tool_card_request("", card_tool_name, arguments)
+        request_payload = build_tool_card_request(server_name, card_tool_name, arguments)
         display_result = error if is_error and error else _tool_display_result(
             tool_name=tool_name,
             result=result,
             file_changes=file_changes,
         )
-        response_payload = build_tool_card_response("", card_tool_name, display_result)
+        response_payload = build_tool_card_response(server_name, card_tool_name, display_result)
         event: Dict[str, object] = {
             "type": "tool_end",
             "conversation_id": conversation_id,
             "id": tool_call_id,
             "turn_id": turn_id,
             "tool": card_tool_name,
+            **({"server": server_name} if server_name else {}),
+            **({"source_tool": source_tool_name} if source_tool_name != card_tool_name else {}),
             "arguments": arguments,
             "request": request_payload,
             "result": display_result,
@@ -2500,6 +2618,8 @@ class OpenCodeAppServerTransport:
             "item_id": tool_call_id,
             "turn_id": turn_id,
             "tool": card_tool_name,
+            **({"server": server_name} if server_name else {}),
+            **({"source_tool": source_tool_name} if source_tool_name != card_tool_name else {}),
             "arguments": arguments,
             "request": request_payload,
             "result": display_result,
@@ -2524,6 +2644,93 @@ class OpenCodeAppServerTransport:
                 turn_id=turn_id,
                 file_change=file_change,
             )
+
+    async def _fanout_plan_update(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        tool_call_id: str,
+        steps: List[Dict[str, object]],
+    ) -> None:
+        signature = _plan_signature(steps)
+        if self._turn_plan_signatures.get(turn_id) == signature:
+            return
+        normalized_steps = [dict(step) for step in steps]
+        self._turn_plan_steps[turn_id] = normalized_steps
+        self._turn_plan_signatures[turn_id] = signature
+        plan_content = _plan_steps_markdown(normalized_steps)
+        state_event: Dict[str, object] = {
+            "type": "plan_state",
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "has_plan": False,
+            "has_todo": True,
+            "plan_exists": False,
+            "plan_content": plan_content,
+            "plan_steps": normalized_steps,
+            "todo_source": "opencode:todowrite",
+            "plan_operation": "update",
+        }
+        update_event: Dict[str, object] = {
+            "type": "plan_update",
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "steps": normalized_steps,
+            "plan_steps": normalized_steps,
+            "source": "opencode:todowrite",
+        }
+        if tool_call_id:
+            state_event["tool_call_id"] = tool_call_id
+            update_event["tool_call_id"] = tool_call_id
+        await self._broadcast_fn(state_event)
+        await self._broadcast_fn(update_event)
+
+    async def _fanout_final_plan(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+    ) -> None:
+        steps = self._turn_plan_steps.get(turn_id)
+        if not steps:
+            return
+        plan_id = f"{turn_id}:plan"
+        plan_content = _plan_steps_markdown(steps)
+        state_event: Dict[str, object] = {
+            "type": "plan_state",
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "has_plan": False,
+            "has_todo": True,
+            "plan_exists": False,
+            "plan_content": plan_content,
+            "plan_steps": steps,
+            "todo_source": "opencode:todowrite",
+        }
+        live_event: Dict[str, object] = {
+            "type": "plan",
+            "conversation_id": conversation_id,
+            "id": plan_id,
+            "item_id": plan_id,
+            "turn_id": turn_id,
+            "steps": steps,
+            "source": "opencode:todowrite",
+        }
+        transcript_entry: Dict[str, object] = {
+            "role": "plan",
+            "id": plan_id,
+            "item_id": plan_id,
+            "turn_id": turn_id,
+            "steps": steps,
+            "source": "opencode:todowrite",
+            "timestamp": _utc_ts(),
+            "event": "tool_todo_plan",
+            "conversation_id": conversation_id,
+        }
+        await self._broadcast_fn(state_event)
+        await self._broadcast_fn(live_event)
+        await self._transcript_fn(conversation_id, transcript_entry)
 
     async def _fanout_command_completed(
         self,
@@ -2788,6 +2995,8 @@ class OpenCodeAppServerTransport:
             self._turn_finalized_reasoning_keys.discard(reasoning_key)
         self._turn_active_reasoning_keys.pop(turn_id, None)
         self._turn_reasoning_next_indexes.pop(turn_id, None)
+        self._turn_plan_steps.pop(turn_id, None)
+        self._turn_plan_signatures.pop(turn_id, None)
         self._detached_turns.discard(turn_id)
         for tool_call_id, request in list(self._turn_tool_requests.items()):
             if request.get("turn_id") == turn_id:
@@ -2824,5 +3033,7 @@ class OpenCodeAppServerTransport:
         self._turn_active_reasoning_keys.clear()
         self._turn_reasoning_next_indexes.clear()
         self._turn_finalized_reasoning_keys.clear()
+        self._turn_plan_steps.clear()
+        self._turn_plan_signatures.clear()
         self._turn_tool_requests.clear()
         self._pending_approval_requests.clear()
