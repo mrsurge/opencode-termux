@@ -21,6 +21,12 @@ const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <te
 ## Constraints & Preferences
 - [user constraints, preferences, specs, or "(none)"]
 
+## Conversation Narrative
+- [brief chronological account of how the work reached the current state, or "(none)"]
+
+## Prior Compaction Carryover
+- [still-relevant information from previous summaries that must remain available, or "(none)"]
+
 ## Progress
 ### Done
 - [completed work or "(none)"]
@@ -48,6 +54,8 @@ Rules:
 - Keep every section, even when empty.
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, commands, error strings, and identifiers when known.
+- Preserve causal continuity: include why the current approach was chosen, what was rejected, and what recent failures or discoveries changed direction.
+- Preserve still-relevant information from previous compactions. Do not drop prior context merely because it is older than the latest turns.
 - Do not mention the summary process or that context was compacted.`
 
 type Entry = {

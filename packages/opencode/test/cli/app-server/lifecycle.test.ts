@@ -66,6 +66,7 @@ describe("opencode app-server subprocess", () => {
               approvals: true,
               userInput: true,
               mcp: true,
+              compaction: true,
             },
           },
         })
@@ -1097,6 +1098,91 @@ test("app-server forwards session messages params", async () => {
   })
 })
 
+test("app-server forwards session compact params", async () => {
+  const requests: unknown[] = []
+  const response = await handleLine(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "session/compact",
+      params: {
+        threadId: "ses_test",
+        provider: "test",
+        model: "test-model",
+        auto: true,
+      },
+    }),
+    {
+      listProviders: async () => ({ data: [] }),
+      listModels: async () => ({ data: [] }),
+      listModelVariants: async () => ({ data: [] }),
+      createSession: async () => {
+        throw new Error("unused")
+      },
+      listSessions: async () => ({ data: [] }),
+      getSessionStatus: async () => {
+        throw new Error("unused")
+      },
+      resumeSession: async () => {
+        throw new Error("unused")
+      },
+      compactSession: async (params) => {
+        requests.push(params)
+        return {
+          ok: true,
+          sessionId: params.sessionId,
+          providerSessionId: params.sessionId,
+          threadId: params.sessionId,
+          provider: params.provider ?? "test",
+          model: params.model ?? "test-model",
+          auto: params.auto ?? false,
+        }
+      },
+      startTurn: async () => {
+        throw new Error("unused")
+      },
+      cancelTurn: async () => {
+        throw new Error("unused")
+      },
+      respondToolApproval: async () => {
+        throw new Error("unused")
+      },
+      respondUserInput: async () => {
+        throw new Error("unused")
+      },
+      rejectUserInput: async () => {
+        throw new Error("unused")
+      },
+    },
+  )
+
+  expect(requests).toEqual([
+    {
+      sessionId: "ses_test",
+      provider: "test",
+      model: "test-model",
+      variant: undefined,
+      reasoningEffort: undefined,
+      auto: true,
+    },
+  ])
+  expect(response).toEqual({
+    response: {
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        ok: true,
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        provider: "test",
+        model: "test-model",
+        auto: true,
+      },
+    },
+  })
+})
+
 test("app-server rejects malformed session instruction params", async () => {
   const response = await handleLine(
     JSON.stringify({
@@ -1491,6 +1577,127 @@ test("app-server translates session errors into failed turn completion", () => {
         content: "partial",
         reasoning: "thought",
         error: { type: "unknown", message: "Model not found: openrouter/google/gemma-4-31b-it" },
+      },
+    },
+  ])
+})
+
+test("app-server keeps context overflow errors nonterminal for compaction", () => {
+  const activeTurns = new Map<string, ActiveTurn>([
+    [
+      "ses_test",
+      {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        content: ["partial"],
+        reasoning: ["thought"],
+      },
+    ],
+  ])
+  const overflowError = {
+    name: "ContextOverflowError",
+    data: {
+      message: "Input exceeds context window of this model",
+      responseBody: JSON.stringify({
+        error: {
+          code: "context_length_exceeded",
+          message: "Your input exceeds the context window of this model.",
+        },
+      }),
+    },
+  }
+
+  const messages = turnNotifications(activeTurns, {
+    type: "session.error",
+    properties: {
+      sessionID: "ses_test",
+      error: overflowError,
+    },
+  } as Parameters<typeof turnNotifications>[1])
+
+  expect(activeTurns.has("ses_test")).toBe(true)
+  expect(messages).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/warning",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        warningType: "context_overflow",
+        message: "Input exceeds context window of this model",
+        error: overflowError,
+        action: {
+          id: "compaction_auto",
+          label: "Compacting",
+        },
+      },
+    },
+  ])
+})
+
+test("app-server translates compaction events into context notifications", () => {
+  const activeTurns = new Map<string, ActiveTurn>([
+    [
+      "ses_test",
+      {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        content: [],
+        reasoning: [],
+      },
+    ],
+  ])
+
+  const started = turnNotifications(activeTurns, {
+    type: "session.next.compaction.started",
+    properties: {
+      sessionID: "ses_test",
+      messageID: "msg_compact",
+      reason: "auto",
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const ended = turnNotifications(activeTurns, {
+    type: "session.next.compaction.ended",
+    properties: {
+      sessionID: "ses_test",
+      messageID: "msg_compact",
+      reason: "auto",
+      text: "Compacted summary.",
+      recent: "[]",
+    },
+  } as Parameters<typeof turnNotifications>[1])
+
+  expect(started).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/compactionStarted",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        compactionId: "msg_compact",
+        messageId: "msg_compact",
+        reason: "auto",
+      },
+    },
+  ])
+  expect(ended).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/compactionCompleted",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        compactionId: "msg_compact",
+        messageId: "msg_compact",
+        reason: "auto",
+        summary: "Compacted summary.",
+        recent: "[]",
       },
     },
   ])

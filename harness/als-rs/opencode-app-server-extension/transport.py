@@ -190,6 +190,35 @@ def _status_dot(status: str) -> str:
     return "success"
 
 
+def _error_message(value: Mapping[str, object]) -> str:
+    data = _object_dict(value.get("data"))
+    response_body = _optional_str(data.get("responseBody"))
+    response_error = _object_dict(_object_dict(_json_object(response_body)).get("error"))
+    return (
+        _optional_str(data.get("message"))
+        or _optional_str(response_error.get("message"))
+        or _optional_str(value.get("message"))
+        or _optional_str(value.get("error"))
+        or ""
+    )
+
+
+def _warning_message(params: Mapping[str, object]) -> str:
+    error = _object_dict(params.get("error"))
+    return _optional_str(params.get("message")) or _error_message(error)
+
+
+def _json_object(value: object) -> Dict[str, object]:
+    text = _optional_str(value)
+    if not text:
+        return {}
+    try:
+        parsed = cast(object, json.loads(text))
+    except json.JSONDecodeError:
+        return {}
+    return _object_dict(parsed)
+
+
 def _first_number(*values: object) -> Optional[float]:
     for value in values:
         number = _optional_number(value)
@@ -1162,6 +1191,8 @@ class OpenCodeAppServerTransport:
         self._turn_waiters: Dict[str, asyncio.Future[Dict[str, object]]] = {}
         self._turn_conversations: Dict[str, str] = {}
         self._turn_session_names: Dict[str, str] = {}
+        self._turn_provider_session_ids: Dict[str, str] = {}
+        self._turn_deliveries: Dict[str, str] = {}
         self._turn_approval_policies: Dict[str, str] = {}
         self._session_conversations: Dict[str, str] = {}
         self._detached_turns: set[str] = set()
@@ -1278,6 +1309,44 @@ class OpenCodeAppServerTransport:
             return False
         self._pending_approval_requests.pop(request_id_text, None)
         return True
+
+    async def cancel_turn_for_conversation(self, conversation_id: str) -> Dict[str, object]:
+        turn_id = self._active_turn_id_for_conversation(conversation_id)
+        if not turn_id:
+            return {
+                "ok": False,
+                "error": "no active turn",
+                "conversation_id": conversation_id,
+            }
+        session_name = self._turn_session_names.get(turn_id) or ""
+        provider_session_id = self._turn_provider_session_ids.get(turn_id) or ""
+        if not provider_session_id:
+            provider_session_id = _provider_session_id(self._active_sessions.get(session_name))
+        if not provider_session_id:
+            return {
+                "ok": False,
+                "error": "no active provider session",
+                "conversation_id": conversation_id,
+                "turn_id": turn_id,
+            }
+        result = await self.rpc_request(
+            "turn/cancel",
+            params={
+                "sessionName": session_name,
+                "sessionId": provider_session_id,
+                "providerSessionId": provider_session_id,
+                "turnId": turn_id,
+            },
+            timeout=10.0,
+            conversation_id=conversation_id,
+        )
+        return {
+            "ok": result.get("cancelled") is True,
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "provider_session_id": provider_session_id,
+            **result,
+        }
 
     async def ensure_ready(self, cwd: Optional[str] = None) -> None:
         async with self._lock:
@@ -1476,6 +1545,7 @@ class OpenCodeAppServerTransport:
             self._turn_waiters[turn_id] = future
         self._turn_conversations[turn_id] = conversation_id
         self._turn_session_names[turn_id] = session_name
+        self._turn_provider_session_ids[turn_id] = provider_session_id or ""
         self._turn_approval_policies[turn_id] = approval_policy
         self._session_conversations[session_name] = conversation_id
         self._turn_buffers[turn_id] = []
@@ -1490,6 +1560,7 @@ class OpenCodeAppServerTransport:
             provider_session_id = _provider_session_id(session)
             if not provider_session_id:
                 raise RuntimeError("app-server session did not return a provider session id")
+            self._turn_provider_session_ids[turn_id] = provider_session_id
             params: Dict[str, object] = {
                 "sessionName": session_name,
                 "sessionId": provider_session_id,
@@ -1514,6 +1585,8 @@ class OpenCodeAppServerTransport:
                 timeout=10.0,
                 conversation_id=conversation_id,
             )
+            delivery = accepted.get("delivery")
+            self._turn_deliveries[turn_id] = delivery if isinstance(delivery, str) else ""
             if not wait_for_completion:
                 self._detached_turns.add(turn_id)
                 keep_turn_state = True
@@ -1862,6 +1935,32 @@ class OpenCodeAppServerTransport:
                     params=params,
                 )
             return
+        if method == "turn/warning" and turn_id:
+            if conversation_id:
+                await self._fanout_warning(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    params=params,
+                )
+            return
+        if method == "turn/compactionStarted" and turn_id:
+            if conversation_id:
+                await self._fanout_compaction_started(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    params=params,
+                )
+            return
+        if method == "turn/compactionCompleted" and turn_id:
+            if conversation_id:
+                await self._fanout_context_compacted(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    params=params,
+                )
+            return
+        if method == "turn/compactionDelta" and turn_id:
+            return
         if method == "turn/usage" and turn_id:
             usage = _turn_usage(params)
             if conversation_id and usage:
@@ -1905,8 +2004,12 @@ class OpenCodeAppServerTransport:
                 self._detached_turns.discard(turn_id)
             return
         if method == "turn/error" and turn_id:
-            # `turn/error` is diagnostic; `turn/completed` is the terminal
-            # lifecycle event that finalizes buffered content and clears state.
+            if conversation_id:
+                await self._fanout_error(
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    params=params,
+                )
             return
 
     async def _fanout_turn_started(
@@ -2029,6 +2132,125 @@ class OpenCodeAppServerTransport:
         }
         await self._broadcast_fn(event)
         await self._transcript_fn(conversation_id, transcript_entry)
+
+    async def _fanout_warning(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        params: Dict[str, object],
+    ) -> None:
+        message = _warning_message(params)
+        if not message:
+            return
+        event: Dict[str, object] = {
+            "type": "warning",
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "message": message,
+            "source": "opencode-app-server",
+        }
+        action = params.get("action")
+        if isinstance(action, Mapping):
+            event["action"] = _object_dict(cast(object, action))
+        warning_type = _optional_str(params.get("warningType")) or _optional_str(params.get("warning_type"))
+        if warning_type:
+            event["warning_type"] = warning_type
+        await self._broadcast_fn(event)
+
+    async def _fanout_error(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        params: Dict[str, object],
+    ) -> None:
+        error = _object_dict(params.get("error"))
+        message = _error_message(error) or _error_message(params) or "OpenCode runtime error"
+        error_type = _optional_str(error.get("name")) or _optional_str(error.get("type")) or _optional_str(params.get("errorType"))
+        event: Dict[str, object] = {
+            "type": "error",
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "message": message,
+            "source": "opencode-app-server",
+        }
+        transcript_entry: Dict[str, object] = {
+            "role": "error",
+            "message": message,
+            "text": message,
+            "turn_id": turn_id,
+            "timestamp": _utc_ts(),
+            "conversation_id": conversation_id,
+            "source": "opencode-app-server",
+        }
+        if error_type:
+            event["error_type"] = error_type
+            transcript_entry["error_type"] = error_type
+        if error:
+            event["details"] = error
+            transcript_entry["details"] = error
+        await self._broadcast_fn(event)
+        await self._transcript_fn(conversation_id, transcript_entry)
+
+    async def _fanout_compaction_started(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        params: Dict[str, object],
+    ) -> None:
+        await self._broadcast_fn({
+            "type": "activity",
+            "conversation_id": conversation_id,
+            "label": "compacting",
+            "active": True,
+            "turn_id": turn_id,
+            "source": "opencode-app-server",
+            "reason": params.get("reason"),
+        })
+
+    async def _fanout_context_compacted(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        params: Dict[str, object],
+    ) -> None:
+        event: Dict[str, object] = {
+            "type": "context_compacted",
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "source": "opencode-app-server",
+        }
+        transcript_entry: Dict[str, object] = {
+            "role": "context_compacted",
+            "turn_id": turn_id,
+            "timestamp": _utc_ts(),
+            "conversation_id": conversation_id,
+            "source": "opencode-app-server",
+        }
+        reason = _optional_str(params.get("reason"))
+        if reason:
+            event["reason"] = reason
+            transcript_entry["reason"] = reason
+        summary = _optional_str(params.get("summary"))
+        if summary:
+            event["summary"] = summary
+            transcript_entry["summary"] = summary
+        recent = _optional_str(params.get("recent"))
+        if recent:
+            transcript_entry["recent"] = recent
+        await self._broadcast_fn(event)
+        await self._transcript_fn(conversation_id, transcript_entry)
+        await self._broadcast_fn({
+            "type": "activity",
+            "conversation_id": conversation_id,
+            "label": "compacting",
+            "active": False,
+            "turn_id": turn_id,
+            "source": "opencode-app-server",
+        })
 
     async def _fanout_agent_message(
         self,
@@ -2977,10 +3199,25 @@ class OpenCodeAppServerTransport:
                 return conversation_id
         return "__opencode_transport__"
 
+    def _active_turn_id_for_conversation(self, conversation_id: str) -> Optional[str]:
+        matching = [
+            turn_id
+            for turn_id, mapped_conversation_id in self._turn_conversations.items()
+            if mapped_conversation_id == conversation_id
+        ]
+        for turn_id in reversed(matching):
+            if self._turn_deliveries.get(turn_id) == "steer":
+                return turn_id
+        for turn_id in reversed(matching):
+            return turn_id
+        return None
+
     def _cleanup_turn_state(self, turn_id: str) -> None:
         self._turn_waiters.pop(turn_id, None)
         self._turn_conversations.pop(turn_id, None)
         self._turn_session_names.pop(turn_id, None)
+        self._turn_provider_session_ids.pop(turn_id, None)
+        self._turn_deliveries.pop(turn_id, None)
         self._turn_approval_policies.pop(turn_id, None)
         self._turn_buffers.pop(turn_id, None)
         message_keys = set(self._turn_message_buffers.pop(turn_id, {}))

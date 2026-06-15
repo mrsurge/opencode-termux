@@ -1299,6 +1299,26 @@ async def resolve_approval(request_id: str, resolution: object) -> bool:
     return await transport.resolve_approval(request_id, resolution)
 
 
+async def abort_session(conversation_id: str) -> bool:
+    if not conversation_id:
+        return False
+    transport = _transport
+    if transport is None:
+        return False
+    try:
+        result = await transport.cancel_turn_for_conversation(conversation_id)
+    except Exception as exc:
+        _add_to_raw_buffer("err", conversation_id, f"interrupt_failed {exc}")
+        return False
+    if result.get("ok") is True:
+        turn_id = _string_value(result.get("turn_id"), result.get("turnId"))
+        _add_to_raw_buffer("out", conversation_id, f"turn_cancel turn={turn_id[:8]}")
+        return True
+    error = _string_value(result.get("error")) or "interrupt not accepted"
+    _add_to_raw_buffer("err", conversation_id, f"interrupt_failed {error}")
+    return False
+
+
 def validate_pending_approval(
     conversation_id: str,
     request_id: str,

@@ -57,9 +57,10 @@ type ServerInitializeResult = {
     readonly tools: false
     readonly models: true
     readonly providers: true
-    readonly approvals: true
-    readonly userInput: true
-    readonly mcp: true
+      readonly approvals: true
+      readonly userInput: true
+      readonly mcp: true
+      readonly compaction: true
   }
 }
 
@@ -281,6 +282,21 @@ type SessionResumeResult = {
   readonly threadId: string
 }
 
+type SessionCompactParams = {
+  readonly sessionId: string
+  readonly auto?: boolean
+} & ModelSelectionParams
+
+type SessionCompactResult = {
+  readonly ok: true
+  readonly sessionId: string
+  readonly providerSessionId: string
+  readonly threadId: string
+  readonly provider: string
+  readonly model: string
+  readonly auto: boolean
+}
+
 type TurnStartParams = {
   readonly sessionId: string
   readonly turnId?: string
@@ -370,6 +386,7 @@ type AppServerServices = {
   readonly sessionMessages?: (params: SessionMessagesParams) => Promise<SessionMessagesResult>
   readonly getSessionStatus: (params: SessionStatusParams) => Promise<SessionStatusResult>
   readonly resumeSession: (params: SessionResumeParams) => Promise<SessionResumeResult>
+  readonly compactSession?: (params: SessionCompactParams) => Promise<SessionCompactResult>
   readonly startTurn: (params: TurnStartParams, emit: NotificationEmitter) => Promise<TurnStartResult>
   readonly cancelTurn: (params: TurnCancelParams, emit: NotificationEmitter) => Promise<TurnCancelResult>
   readonly respondToolApproval: (params: ToolApprovalRespondParams) => Promise<ToolApprovalRespondResult>
@@ -389,6 +406,7 @@ export type ActiveTurn = {
   assistantMessageIds?: Set<string>
   started?: boolean
   cancelRequested?: boolean
+  readonly modelSelection?: RouteModelSelection
   readonly contextWindow?: number
   readonly cleanup?: NotificationCleanup
 }
@@ -590,6 +608,16 @@ export const AppServerCommand = effectCmd({
           await routeApplyMcpServers(routeClient, session.directory, params.mcpServers, appliedMcpServers)
           return routeSessionResumeResult(session)
         },
+        compactSession: async (params) => {
+          const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
+            notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
+          })
+          const selectedModel = routeModelSelection(params) ?? routeSessionModelSelection(session)
+          if (!selectedModel) throw new AppServerError(-32602, "session/compact requires provider/model or a session model.")
+          routeRequireModelSelection(await routeProviderCatalog(routeClient, session.directory), selectedModel)
+          await routeCompactSession(routeClient, session, selectedModel, params.auto ?? false)
+          return routeSessionCompactResult(session, selectedModel, params.auto ?? false)
+        },
         startTurn: async (params, emit) => {
           const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
             notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
@@ -610,6 +638,7 @@ export const AppServerCommand = effectCmd({
             toolStates: new Map(),
             assistantMessageIds: new Set(),
             started: false,
+            ...(selectedModel ? { modelSelection: selectedModel } : {}),
             ...(selectedModel && providerCatalog
               ? { contextWindow: routeModelContextWindow(providerCatalog, selectedModel) }
               : {}),
@@ -1098,6 +1127,25 @@ async function routeSubmitTurn(
   }
 }
 
+async function routeCompactSession(
+  client: RouteClient,
+  session: RouteSession,
+  selectedModel: RouteModelSelection,
+  auto: boolean,
+) {
+  await routeVoid(
+    "session.summarize",
+    client.session.summarize({
+      sessionID: session.id,
+      directory: session.directory,
+      providerID: selectedModel.providerID,
+      modelID: selectedModel.modelID,
+      auto,
+    }),
+    { notFound: new AppServerError(-32010, `Session not found: ${session.id}`) },
+  )
+}
+
 async function routeStartNextQueuedTurn(
   client: RouteClient,
   activeTurns: Map<string, ActiveTurn>,
@@ -1154,8 +1202,14 @@ function routeTurnNotifications(activeTurns: Map<string, ActiveTurn>, event: unk
   if (type === "message.part.delta") return routePartDeltaNotifications(turn, properties)
   if (type === "message.part.updated") return routePartUpdatedNotifications(turn, properties)
   if (type === "session.error") {
-    return turnFailureNotifications(activeTurns, sessionId, properties.error ?? { type: "unknown", message: "Session failed." })
+    const eventError = properties.error ?? { type: "unknown", message: "Session failed." }
+    if (routeContextOverflowError(eventError)) return routeContextOverflowNotifications(turn, eventError)
+    return turnFailureNotifications(activeTurns, sessionId, eventError)
   }
+  if (type === "session.next.compaction.started") return routeCompactionStartedNotifications(turn, properties)
+  if (type === "session.next.compaction.delta") return routeCompactionDeltaNotifications(turn, properties)
+  if (type === "session.next.compaction.ended") return routeCompactionCompletedNotifications(turn, properties)
+  if (type === "session.compacted") return routeLegacyCompactedNotifications(turn, properties)
   if (type === "session.status") return routeSessionStatusNotifications(activeTurns, sessionId, properties)
   if (type === "permission.asked") return routePermissionAskedNotifications(turn, properties)
   if (type === "permission.replied") return routePermissionRepliedNotifications(turn, properties)
@@ -1187,6 +1241,7 @@ function routeEventSessionID(type: string | undefined, properties: Record<string
 function routeMessageUpdatedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
   const info = record(properties.info)
   if (stringValue(info.role) !== "assistant") return []
+  if (info.summary === true) return []
   const messageId = stringValue(info.id)
   if (messageId) {
     const assistantMessageIds = turn.assistantMessageIds ?? new Set<string>()
@@ -1428,6 +1483,73 @@ function routeQuestionResolvedNotifications(
   ]
 }
 
+function routeContextOverflowNotifications(turn: ActiveTurn, eventError: unknown): JsonRpcNotification[] {
+  return [
+    notification("turn/warning", {
+      ...turnBase(turn),
+      warningType: "context_overflow",
+      message: routeErrorMessage(eventError) ?? "Input exceeds context window of this model.",
+      error: eventError,
+      action: {
+        id: "compaction_auto",
+        label: "Compacting",
+      },
+    }),
+  ]
+}
+
+function routeCompactionStartedNotifications(
+  turn: ActiveTurn,
+  properties: Record<string, unknown>,
+): JsonRpcNotification[] {
+  return [
+    notification("turn/compactionStarted", {
+      ...turnBase(turn),
+      compactionId: stringValue(properties.messageID),
+      messageId: stringValue(properties.messageID),
+      reason: stringValue(properties.reason),
+    }),
+  ]
+}
+
+function routeCompactionDeltaNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  return [
+    notification("turn/compactionDelta", {
+      ...turnBase(turn),
+      compactionId: stringValue(properties.messageID),
+      messageId: stringValue(properties.messageID),
+      delta: stringValue(properties.text) ?? "",
+    }),
+  ]
+}
+
+function routeCompactionCompletedNotifications(
+  turn: ActiveTurn,
+  properties: Record<string, unknown>,
+): JsonRpcNotification[] {
+  return [
+    notification("turn/compactionCompleted", {
+      ...turnBase(turn),
+      compactionId: stringValue(properties.messageID),
+      messageId: stringValue(properties.messageID),
+      reason: stringValue(properties.reason),
+      summary: stringValue(properties.text) ?? "",
+      recent: stringValue(properties.recent),
+    }),
+  ]
+}
+
+function routeLegacyCompactedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  return [
+    notification("turn/compactionCompleted", {
+      ...turnBase(turn),
+      reason: "auto",
+      source: "session.compacted",
+      summary: stringValue(properties.text) ?? "",
+    }),
+  ]
+}
+
 async function routeSessionMessages(client: RouteClient, params: SessionMessagesParams): Promise<SessionMessagesResult> {
   if (params.order !== undefined && params.order !== "desc") {
     throw new AppServerError(-32602, "session/messages only supports desc order through the HTTP route.")
@@ -1560,6 +1682,18 @@ function routeUserInputRejectResult(session: RouteSession, params: UserInputReje
   }
 }
 
+function routeSessionCompactResult(session: RouteSession, selectedModel: RouteModelSelection, auto: boolean): SessionCompactResult {
+  return {
+    ok: true,
+    sessionId: session.id,
+    providerSessionId: session.id,
+    threadId: session.id,
+    provider: selectedModel.providerID,
+    model: selectedModel.modelID,
+    auto,
+  }
+}
+
 export async function runAppServer(services: AppServerServices) {
   const writer = jsonRpcWriter()
   const emit: NotificationEmitter = (method, params) => {
@@ -1656,6 +1790,14 @@ export async function handleLine(
     const params = sessionResumeParams(request.params)
     if (!params) return { response: error(id.value, -32602, "Invalid params") }
     return handleAsync(id.value, request.method, () => services.resumeSession(params))
+  }
+
+  if (request.method === "session/compact") {
+    const params = sessionCompactParams(request.params)
+    if (!params) return { response: error(id.value, -32602, "Invalid params") }
+    const compactSession = services.compactSession
+    if (!compactSession) return { response: error(id.value, -32601, "Method not found: session/compact") }
+    return handleAsync(id.value, request.method, () => compactSession(params))
   }
 
   if (request.method === "turn/start") {
@@ -1849,6 +1991,26 @@ function sessionResumeParams(value: unknown): SessionResumeParams | undefined {
     reasoningEffort: params.reasoningEffort,
     ...instructions,
     ...mcp,
+  }
+}
+
+function sessionCompactParams(value: unknown): SessionCompactParams | undefined {
+  const params = paramsObject(value)
+  if (!params) return undefined
+  const sessionId = firstString(params.sessionId, params.providerSessionId, params.threadId)
+  if (!sessionId) return undefined
+  if (params.provider !== undefined && typeof params.provider !== "string") return undefined
+  if (params.model !== undefined && typeof params.model !== "string") return undefined
+  if (params.variant !== undefined && typeof params.variant !== "string") return undefined
+  if (params.reasoningEffort !== undefined && typeof params.reasoningEffort !== "string") return undefined
+  if (params.auto !== undefined && typeof params.auto !== "boolean") return undefined
+  return {
+    sessionId,
+    provider: params.provider,
+    model: params.model,
+    variant: params.variant,
+    reasoningEffort: params.reasoningEffort,
+    auto: params.auto,
   }
 }
 
@@ -2067,6 +2229,7 @@ function initializeResult(): ServerInitializeResult {
       approvals: true,
       userInput: true,
       mcp: true,
+      compaction: true,
     },
   }
 }
@@ -2099,6 +2262,34 @@ function turnFailureNotifications(
       error: eventError,
     }),
   ]
+}
+
+function routeContextOverflowError(value: unknown) {
+  const error = record(value)
+  const data = record(error.data)
+  const responseError = record(record(parseResponseBody(data.responseBody)).error)
+  return (
+    stringValue(error.name) === "ContextOverflowError" ||
+    stringValue(error.type) === "ContextOverflowError" ||
+    stringValue(data.name) === "ContextOverflowError" ||
+    stringValue(responseError.code) === "context_length_exceeded"
+  )
+}
+
+function routeErrorMessage(value: unknown) {
+  const error = record(value)
+  const data = record(error.data)
+  const responseError = record(record(parseResponseBody(data.responseBody)).error)
+  return stringValue(data.message) ?? stringValue(responseError.message) ?? stringValue(error.message)
+}
+
+function parseResponseBody(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return undefined
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
 }
 
 function routeAbortError(value: unknown) {
