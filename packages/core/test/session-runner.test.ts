@@ -27,6 +27,7 @@ import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
+import { SessionInstructionOverlay } from "@opencode-ai/core/session-instruction-overlay"
 import { SessionRunCoordinator } from "@opencode-ai/core/session/run-coordinator"
 import { SessionRunner } from "@opencode-ai/core/session/runner"
 import * as SessionRunnerLLM from "@opencode-ai/core/session/runner/llm"
@@ -217,6 +218,7 @@ const skillGuidance = Layer.mock(SkillGuidance.Service, {
     ),
 })
 const referenceGuidance = Layer.mock(ReferenceGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
+const instructionOverlay = SessionInstructionOverlay.layer
 const config = Layer.succeed(
   Config.Service,
   Config.Service.of({
@@ -246,6 +248,7 @@ const runner = SessionRunnerLLM.layer.pipe(
   Layer.provide(agents),
   Layer.provide(skillGuidance),
   Layer.provide(referenceGuidance),
+  Layer.provide(instructionOverlay),
   Layer.provide(config),
 )
 const coordinator = SessionRunCoordinator.layer.pipe(Layer.provide(runner))
@@ -285,6 +288,8 @@ const it = testEffect(
     systemContext,
     location,
     skillGuidance,
+    referenceGuidance,
+    instructionOverlay,
     config,
     runner,
     coordinator,

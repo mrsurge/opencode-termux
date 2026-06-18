@@ -6,7 +6,6 @@ import type { ProviderMetadata } from "@opencode-ai/llm"
 import type { Database } from "../database/database"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
-import { ToolOutput } from "../tool-output"
 import { SessionV1 } from "../v1/session"
 import { AgentAttachment, FileAttachment, Source } from "./prompt"
 import { SessionMessage } from "./message"
@@ -130,7 +129,6 @@ function legacyUser(info: SessionV1.User, parts: readonly SessionV1.Part[]) {
     text: legacyUserText(parts),
     files: legacyFiles(parts),
     agents: legacyAgents(parts),
-    references: [],
     time: { created: DateTime.makeUnsafe(info.time.created) },
   })
 }
@@ -274,7 +272,7 @@ function legacyToolState(state: SessionV1.ToolState): SessionMessage.ToolState {
       input: state.input,
       attachments: state.attachments?.map(legacyFile),
       structured: structured(state.metadata),
-      content: [ToolOutput.text({ type: "text", text: state.output })],
+      content: [{ type: "text", text: state.output }],
       outputPaths: [],
       result: state.output,
     })

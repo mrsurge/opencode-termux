@@ -3,6 +3,8 @@
 ## Current Status
 
 - Target: expose OpenCode's existing in-process HTTP/DTO route stack as typed JSON-RPC over stdio.
+- Maintenance baseline: the active app-server branch is rebased onto upstream `v1.17.8`; the app-server patch stack is six functional commits plus the current rebase-adaptation commit.
+- Next upstream rebase rule: use `quilt` as the actual patch apply path, not only as a generated patch snapshot/reference.
 - Do not reimplement the app-server by directly calling V2/native session services as the primary runtime path.
 - Do not spawn per-session CLI processes or parse CLI output.
 - Do not open a TCP listener for normal stdio mode.

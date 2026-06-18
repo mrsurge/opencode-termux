@@ -1,38 +1,12 @@
 import yargs from "yargs"
 import { hideBin } from "yargs/helpers"
-import { RunCommand } from "./cli/cmd/run"
-import { GenerateCommand } from "./cli/cmd/generate"
-import { ConsoleCommand } from "./cli/cmd/account"
-import { ProvidersCommand } from "./cli/cmd/providers"
-import { AgentCommand } from "./cli/cmd/agent"
-import { UpgradeCommand } from "./cli/cmd/upgrade"
-import { UninstallCommand } from "./cli/cmd/uninstall"
-import { ModelsCommand } from "./cli/cmd/models"
-import { UI } from "./cli/ui"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { FormatError } from "./cli/error"
-import { ServeCommand } from "./cli/cmd/serve"
-import { DebugCommand } from "./cli/cmd/debug"
-import { StatsCommand } from "./cli/cmd/stats"
-import { McpCommand } from "./cli/cmd/mcp"
-import { GithubCommand } from "./cli/cmd/github"
-import { ExportCommand } from "./cli/cmd/export"
-import { ImportCommand } from "./cli/cmd/import"
-import { AttachCommand } from "./cli/cmd/attach"
-import { TuiThreadCommand } from "./cli/cmd/tui"
-import { AcpCommand } from "./cli/cmd/acp"
 import { EOL } from "os"
-import { WebCommand } from "./cli/cmd/web"
-import { PrCommand } from "./cli/cmd/pr"
-import { SessionCommand } from "./cli/cmd/session"
-import { DbCommand } from "./cli/cmd/db"
-import { errorMessage } from "./util/error"
-import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
 const args = hideBin(process.argv)
 
-function show(out: string) {
+function show(out: string, UI: typeof import("./cli/ui").UI) {
   const text = out.trimStart()
   if (!text.startsWith("opencode ")) {
     process.stderr.write(UI.logo() + EOL + EOL)
@@ -42,7 +16,8 @@ function show(out: string) {
   process.stderr.write(out)
 }
 
-const cli = yargs(args)
+function baseCli() {
+  return yargs(args)
   .parserConfiguration({ "populate--": true })
   .scriptName("opencode")
   .wrap(100)
@@ -78,7 +53,53 @@ const cli = yargs(args)
   })
   .usage("")
   .completion("completion", "generate shell completion script")
+}
+
+const commandName = args.find((arg) => !arg.startsWith("-"))
+
+if (commandName === "app-server") {
+  const { AppServerCommand } = await import("./cli/cmd/app-server")
+  try {
+    await baseCli().command(AppServerCommand).strict().parse()
+  } catch (e) {
+    process.stderr.write(String(e instanceof Error ? e.message : e) + EOL)
+    process.exitCode = 1
+  } finally {
+    process.exit()
+  }
+}
+
+const { RunCommand } = await import("./cli/cmd/run")
+const { GenerateCommand } = await import("./cli/cmd/generate")
+const { ConsoleCommand } = await import("./cli/cmd/account")
+const { ProvidersCommand } = await import("./cli/cmd/providers")
+const { AgentCommand } = await import("./cli/cmd/agent")
+const { UpgradeCommand } = await import("./cli/cmd/upgrade")
+const { UninstallCommand } = await import("./cli/cmd/uninstall")
+const { ModelsCommand } = await import("./cli/cmd/models")
+const { UI } = await import("./cli/ui")
+const { FormatError } = await import("./cli/error")
+const { ServeCommand } = await import("./cli/cmd/serve")
+const { DebugCommand } = await import("./cli/cmd/debug")
+const { StatsCommand } = await import("./cli/cmd/stats")
+const { McpCommand } = await import("./cli/cmd/mcp")
+const { GithubCommand } = await import("./cli/cmd/github")
+const { ExportCommand } = await import("./cli/cmd/export")
+const { ImportCommand } = await import("./cli/cmd/import")
+const { AttachCommand } = await import("./cli/cmd/attach")
+const { TuiThreadCommand } = await import("./cli/cmd/tui")
+const { AcpCommand } = await import("./cli/cmd/acp")
+const { WebCommand } = await import("./cli/cmd/web")
+const { PrCommand } = await import("./cli/cmd/pr")
+const { SessionCommand } = await import("./cli/cmd/session")
+const { DbCommand } = await import("./cli/cmd/db")
+const { errorMessage } = await import("./util/error")
+const { PluginCommand } = await import("./cli/cmd/plug")
+const { AppServerCommand } = await import("./cli/cmd/app-server")
+
+const cli = baseCli()
   .command(AcpCommand)
+  .command(AppServerCommand)
   .command(McpCommand)
   .command(TuiThreadCommand)
   .command(AttachCommand)
@@ -108,7 +129,7 @@ const cli = yargs(args)
       msg?.startsWith("Invalid values:")
     ) {
       if (err) throw err
-      cli.showHelp(show)
+      cli.showHelp((out) => show(out, UI))
     }
     if (err) throw err
     process.exit(1)
@@ -120,7 +141,7 @@ try {
     await cli.parse(args, (err: Error | undefined, _argv: unknown, out: string) => {
       if (err) throw err
       if (!out) return
-      show(out)
+      show(out, UI)
     })
   } else {
     await cli.parse()
