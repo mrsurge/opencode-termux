@@ -1195,14 +1195,20 @@ export const layer = Layer.effect(
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            const taskUser = msgs.find(
+              (msg): msg is SessionV1.WithParts & { info: SessionV1.User } =>
+                msg.info.role === "user" && msg.info.id === task.messageID,
+            )?.info
+            if (!taskUser) throw new Error(`Subtask parent must be a user message: ${task.messageID}`)
+            const taskModel = yield* getModel(taskUser.model.providerID, taskUser.model.modelID, sessionID)
+            yield* handleSubtask({ task, model: taskModel, lastUser: taskUser, sessionID, session, msgs })
             continue
           }
 
           if (task?.type === "compaction") {
             const result = yield* compaction.process({
               messages: msgs,
-              parentID: lastUser.id,
+              parentID: task.messageID,
               sessionID,
               auto: task.auto,
               overflow: task.overflow,

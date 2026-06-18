@@ -122,8 +122,7 @@ Active tracker items:
   call is still pending.
 - [x] Validate a new turn can be admitted and completed after cancellation.
 - [x] Update the copied ALS-RS OpenCode extension scaffold so the shellspec
-  launches the local live-source `opencode-spike app-server` instead of the
-  mock Python app-server.
+  launches the local live-source checkout instead of the mock Python app-server.
 - [x] Pin the ALS app-server shellspec to `OPENCODE_DB=opencode-dev.db` so the
   live-source app-server shares the compiled `opencode-spike-bin` CLI session
   database instead of defaulting to the source channel's `opencode-local.db`.
@@ -235,6 +234,14 @@ Current validation:
   `fast` variant. The app-server preserves nested request metadata such as
   `options.reasoning.effort` and `options.serviceTier`.
 - Passed:
+  focused compaction poisoning regressions from `packages/opencode`:
+  `bun test test/session/message-v2.test.ts -t "stale compaction task remains bound" --timeout 150000`
+  and
+  `bun test test/session/compaction.test.ts -t "does not summarize user messages after a stale compaction marker" --timeout 150000`.
+  These cover the CLI/TUI failure where an interrupted compaction marker was
+  later consumed under a normal user prompt and produced `summary: true` on the
+  wrong message.
+- Passed:
   direct source-wrapper usage smoke with `openrouter/google/gemma-4-31b-it`.
   `turn/completed` now includes raw `tokens`, normalized `usage`, `contextWindow`
   / `context_window`, and `usage.contextPercent`; the ALS adapter maps that into
@@ -305,8 +312,8 @@ Current validation:
   `ToolResultValue` type-cycle cleanup in `packages/llm` was needed so the
   locally compiled `tsgo` can complete the package check.
 - Passed:
-  `opencode-spike --help` through the local Bun-backed wrapper at
-  `/data/data/com.termux/files/home/.local/bin/opencode-spike`.
+  `opencode --version` through the local Bun-backed wrapper at
+  `/data/data/com.termux/files/home/.local/bin/opencode`.
 - Passed:
   `opencode-spike-bin --version` and `opencode-spike-bin app-server`
   initialize/shutdown smoke through the compiled snapshot at
@@ -316,15 +323,15 @@ Current validation:
 
 Two local launchers are available for manual testing:
 
-- `opencode-spike`: live-source wrapper installed at
-  `/data/data/com.termux/files/home/.local/share/opencode-appserver-spike/bin/opencode-spike`
-  and symlinked at `/data/data/com.termux/files/home/.local/bin/opencode-spike`.
+- `opencode`: live-source wrapper installed at
+  `/data/data/com.termux/files/home/.local/share/opencode-appserver/bin/opencode`
+  and symlinked at `/data/data/com.termux/files/home/.local/bin/opencode`.
   For default TUI launches, the relevant wrapper shape is:
 
   ```sh
   caller_cwd="$(pwd)"
   export OPENCODE_DB="${OPENCODE_DB:-opencode-dev.db}"
-  cd /data/data/com.termux/files/home/test-projects/open-gemini-cli-appserver-spike/worktrees/opencode/packages/opencode
+  cd /data/data/com.termux/files/home/test-projects/opencode/packages/opencode
 
   # Default TUI launch only; explicit project paths and subcommands are
   # forwarded without injecting caller_cwd.
@@ -344,6 +351,9 @@ Two local launchers are available for manual testing:
   Use this while developing app-server code because it runs the active checkout.
   The ALS extension also pins this launcher to `OPENCODE_DB=opencode-dev.db`
   for storage parity with the compiled CLI snapshot.
+
+  `/data/data/com.termux/files/home/.local/bin/opencode-spike` is retained only
+  as a compatibility symlink to the same `opencode` wrapper.
 
 - `opencode-spike-bin`: compiled snapshot installed at
   `/data/data/com.termux/files/home/.local/share/opencode-appserver-spike/bin/opencode-spike-bin`

@@ -55,6 +55,7 @@ _OPENROUTER_MODEL_CACHE: Dict[Tuple[str, str, str], Tuple[float, List[Dict[str, 
 _TE2_MCP_SERVER_NAME = "te2-mcp"
 _TE2_MCP_STREAMABLE_HTTP_ROUTE = "/te2_mcp_http"
 _AGENT_PTY_BLOCKS_MCP_SERVER_NAME = "agent-pty-blocks"
+_AGENT_PTY_BLOCKS_TIMEOUT_MS = 100_000 * 60 * 1000
 _DEVINS_CONTEXT_SETTINGS_KEY = "__als_devins_context__"
 
 
@@ -407,15 +408,16 @@ def _agent_pty_blocks_local_server(
     defaults: Dict[str, object],
     context: Dict[str, object],
     settings: Dict[str, object],
+    conversation_id: Optional[str],
 ) -> Dict[str, object]:
     transport = _string_value(defaults.get("transport")).replace("_", "-")
     if transport and transport not in {"stdio", "local"}:
         raise ValueError("agent-pty-blocks MCP requires stdio transport")
-    conversation_id = _string_value(defaults.get("conversation_id"), context.get("conversation_id"))
-    if not conversation_id:
+    resolved_conversation_id = _string_value(conversation_id, defaults.get("conversation_id"), context.get("conversation_id"))
+    if not resolved_conversation_id:
         raise ValueError("agent-pty-blocks MCP requires conversation_id")
     cwd = _string_value(defaults.get("cwd"), context.get("cwd"), settings.get("cwd"))
-    environment: Dict[str, str] = {"CONVERSATION_ID": conversation_id}
+    environment: Dict[str, str] = {"CONVERSATION_ID": resolved_conversation_id}
     if cwd:
         environment["PWD"] = cwd
     appserver_origin = _string_value(defaults.get("appserver_origin"), context.get("appserver_origin"))
@@ -424,14 +426,19 @@ def _agent_pty_blocks_local_server(
     server: Dict[str, object] = {
         "type": "local",
         "command": [sys.executable.strip() or "python3", str(_agent_pty_blocks_script_path())],
+        "env": environment,
         "environment": environment,
+        "timeout": _AGENT_PTY_BLOCKS_TIMEOUT_MS,
     }
     if cwd:
         server["cwd"] = cwd
     return server
 
 
-def _mcp_servers_from_settings(settings: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+def _mcp_servers_from_settings(
+    settings: Optional[Dict[str, object]],
+    conversation_id: Optional[str] = None,
+) -> Optional[Dict[str, object]]:
     if not isinstance(settings, dict):
         return None
     direct_servers = _object_dict(settings.get("mcpServers"))
@@ -460,6 +467,7 @@ def _mcp_servers_from_settings(settings: Optional[Dict[str, object]]) -> Optiona
             agent_pty_defaults,
             context,
             settings,
+            conversation_id,
         )
     te2_defaults = _object_dict(defaults.get(_TE2_MCP_SERVER_NAME))
     if te2_defaults and te2_defaults.get("enabled_by_default") is not False:
@@ -778,7 +786,7 @@ async def init_session(
     sandbox = _app_server_sandbox_from_policy(_sandbox_policy_from_settings(merged_settings))
     reasoning_effort = _reasoning_effort_from_settings(merged_settings)
     instructions = _instruction_params_from_settings(merged_settings)
-    mcp_servers = _mcp_servers_from_settings(merged_settings)
+    mcp_servers = _mcp_servers_from_settings(merged_settings, conversation_id)
     if bound_session_id:
         session = await _ensure_bound_provider_session_loaded(
             transport,
@@ -845,7 +853,7 @@ async def handle_message(
     sandbox = _app_server_sandbox_from_policy(_sandbox_policy_from_settings(merged_settings))
     reasoning_effort = _reasoning_effort_from_settings(merged_settings)
     instructions = _instruction_params_from_settings(merged_settings)
-    mcp_servers = _mcp_servers_from_settings(merged_settings)
+    mcp_servers = _mcp_servers_from_settings(merged_settings, conversation_id)
     result = await _send_turn_with_lazy_resume(
         transport,
         conversation_id=conversation_id,
@@ -1569,6 +1577,9 @@ async def _schema_current_provider_list(
         item = _object_dict(raw)
         provider_id = _string_value(item.get("id"))
         if not provider_id:
+            continue
+        capabilities = _object_dict(item.get("capabilities"))
+        if provider_id != "opencode" and item.get("configured") is not True and capabilities.get("configured") is not True:
             continue
         default_model = _string_value(item.get("defaultModel"))
         name = _string_value(item.get("displayName"), item.get("name"), provider_id)

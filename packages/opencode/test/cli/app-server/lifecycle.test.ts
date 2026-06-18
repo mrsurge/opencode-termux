@@ -807,7 +807,20 @@ describe("opencode app-server cancellation", () => {
           jsonrpc: "2.0",
           id: 9,
           method: "turn/start",
-          params: { sessionId: sessionResult.sessionId, prompt: "run after first queued test turn" },
+          params: {
+            sessionId: sessionResult.sessionId,
+            prompt: "run after first queued test turn",
+            provider: "missing-provider",
+            model: "missing-model",
+            mcpServers: {
+              "agent-pty-blocks": {
+                type: "local",
+                command: ["/definitely/not/a/real/mcp/server"],
+                env: { CONVERSATION_ID: "conv_test" },
+                timeout: 6_000_000_000,
+              },
+            },
+          },
         })
         const secondQueuedMessages = yield* receiveUntil(appServer, (messages) =>
           messages.some((message) => isResponse(message, 9)),
@@ -820,6 +833,11 @@ describe("opencode app-server cancellation", () => {
           accepted: true,
           delivery: "queue",
         })
+        expect(
+          notificationParamList(secondQueuedMessages, "turn/started").some(
+            (message) => stringField(message, "turnId") === secondQueuedTurnId,
+          ),
+        ).toBe(false)
 
         releaseQueuedFirst()
         const queuedTurnMessages = yield* receiveUntil(appServer, (messages) => {
@@ -843,6 +861,12 @@ describe("opencode app-server cancellation", () => {
             }),
           ]),
         )
+        const firstCompletedIndex = notificationIndex(queuedTurnMessages, "turn/completed", firstQueuedTurnId)
+        const secondStartedIndex = notificationIndex(queuedTurnMessages, "turn/started", secondQueuedTurnId)
+        const secondCompletedIndex = notificationIndex(queuedTurnMessages, "turn/completed", secondQueuedTurnId)
+        expect(firstCompletedIndex).toBeGreaterThanOrEqual(0)
+        expect(secondStartedIndex).toBeGreaterThan(firstCompletedIndex)
+        expect(secondCompletedIndex).toBeGreaterThan(secondStartedIndex)
 
         yield* appServer.send({ jsonrpc: "2.0", id: 10, method: "server/shutdown" })
         const shutdownMessages = yield* receiveUntil(appServer, (messages) =>
@@ -1245,12 +1269,13 @@ test("app-server forwards typed MCP server params", async () => {
     "agent-pty-blocks": {
       type: "local",
       command: ["python3", "/tmp/mcp_agent_pty_server.py"],
-      environment: {
+      env: {
         CONVERSATION_ID: "conv_test",
         PWD: "/tmp",
         AGENT_LOG_SERVER_ORIGIN: "http://127.0.0.1:12459",
       },
       cwd: "/tmp",
+      timeout: 6_000_000_000,
     },
     "te2-mcp": {
       type: "remote",
@@ -1583,16 +1608,14 @@ test("app-server translates session errors into failed turn completion", () => {
 })
 
 test("app-server keeps context overflow errors nonterminal for compaction", () => {
+  const turn: ActiveTurn = {
+    turnId: "turn_test",
+    sessionId: "ses_test",
+    content: ["partial"],
+    reasoning: ["thought"],
+  }
   const activeTurns = new Map<string, ActiveTurn>([
-    [
-      "ses_test",
-      {
-        turnId: "turn_test",
-        sessionId: "ses_test",
-        content: ["partial"],
-        reasoning: ["thought"],
-      },
-    ],
+    ["ses_test", turn],
   ])
   const overflowError = {
     name: "ContextOverflowError",
@@ -1616,6 +1639,7 @@ test("app-server keeps context overflow errors nonterminal for compaction", () =
   } as Parameters<typeof turnNotifications>[1])
 
   expect(activeTurns.has("ses_test")).toBe(true)
+  expect(turn.overflowCompaction).toBe("pending")
   expect(messages).toEqual([
     {
       jsonrpc: "2.0",
@@ -1635,6 +1659,17 @@ test("app-server keeps context overflow errors nonterminal for compaction", () =
       },
     },
   ])
+
+  expect(
+    turnNotifications(activeTurns, {
+      type: "session.status",
+      properties: {
+        sessionID: "ses_test",
+        status: { type: "idle" },
+      },
+    } as Parameters<typeof turnNotifications>[1]),
+  ).toEqual([])
+  expect(activeTurns.has("ses_test")).toBe(true)
 })
 
 test("app-server translates compaction events into context notifications", () => {
@@ -1656,6 +1691,13 @@ test("app-server translates compaction events into context notifications", () =>
       sessionID: "ses_test",
       messageID: "msg_compact",
       reason: "auto",
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const idleDuringCompaction = turnNotifications(activeTurns, {
+    type: "session.status",
+    properties: {
+      sessionID: "ses_test",
+      status: { type: "idle" },
     },
   } as Parameters<typeof turnNotifications>[1])
   const ended = turnNotifications(activeTurns, {
@@ -1684,6 +1726,7 @@ test("app-server translates compaction events into context notifications", () =>
       },
     },
   ])
+  expect(idleDuringCompaction).toEqual([])
   expect(ended).toEqual([
     {
       jsonrpc: "2.0",
@@ -1698,6 +1741,29 @@ test("app-server translates compaction events into context notifications", () =>
         reason: "auto",
         summary: "Compacted summary.",
         recent: "[]",
+      },
+    },
+  ])
+  expect(
+    turnNotifications(activeTurns, {
+      type: "session.status",
+      properties: {
+        sessionID: "ses_test",
+        status: { type: "idle" },
+      },
+    } as Parameters<typeof turnNotifications>[1]),
+  ).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        status: "completed",
+        content: "",
+        reasoning: "",
       },
     },
   ])
@@ -2211,6 +2277,13 @@ function notificationParamList(messages: unknown[], method: string) {
     .filter((message) => isNotification(message, method))
     .map((message) => objectRecord(objectRecord(message)?.params))
     .filter((params): params is Record<string, unknown> => params !== undefined)
+}
+
+function notificationIndex(messages: unknown[], method: string, turnId: string) {
+  return messages.findIndex((message) => {
+    if (!isNotification(message, method)) return false
+    return stringField(objectRecord(objectRecord(message)?.params) ?? {}, "turnId") === turnId
+  })
 }
 
 function stringField(value: Record<string, unknown>, field: string) {

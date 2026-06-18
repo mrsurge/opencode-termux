@@ -1481,6 +1481,26 @@ describe("SessionRunnerLLM", () => {
         type: "compaction",
         summary: "## Goal\n- Preserve the updated task",
       })
+
+      requests.length = 0
+      responses = [
+        fragmentFixture("text", "text-summary-3", ["## Goal\n- Preserve the latest task"]).completeEvents,
+        fragmentFixture("text", "text-final-3", ["Continued latest"]).completeEvents,
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: new Prompt({ text: "Latest exact request ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[0])[0]).toContain(
+        "<previous-summary>\n## Goal\n- Preserve the updated task\n</previous-summary>",
+      )
+      expect(userTexts(requests[0])[0]).not.toContain(
+        "<previous-summary>\n## Goal\n- Preserve the task\n</previous-summary>",
+      )
     }),
   )
 

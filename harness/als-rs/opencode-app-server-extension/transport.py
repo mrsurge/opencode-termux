@@ -357,7 +357,7 @@ def _strip_diff_index_prelude(diff: str) -> str:
         lines = lines[2:]
     if not lines:
         return ""
-    return "\n".join(lines).strip("\n") + "\n"
+    return "\n".join(lines).strip("\n")
 
 
 def _unified_diff_from_strings(*, path: str, old: str, new: str) -> str:
@@ -3020,7 +3020,7 @@ class OpenCodeAppServerTransport:
         file_change: Dict[str, object],
     ) -> None:
         diff_id = str(file_change.get("id") or f"{turn_id}:diff:{uuid.uuid4().hex}")
-        diff_text = str(file_change.get("text") or "")
+        diff_text = str(file_change.get("text") or "").rstrip("\n")
         if not diff_text:
             return
         path = str(file_change.get("path") or "")

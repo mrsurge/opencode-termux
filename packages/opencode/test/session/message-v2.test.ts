@@ -1657,5 +1657,44 @@ describe("session.message-v2.latest", () => {
     expect(state.user?.id).toBe(NEW_COMPACTION_USER)
     expect(state.tasks).toHaveLength(1)
     expect(state.tasks[0]).toMatchObject({ type: "compaction", auto: true })
+    expect(state.tasks[0]?.messageID).toBe(NEW_COMPACTION_USER)
+  })
+
+  test("a stale compaction task remains bound to its owner when a newer user exists", () => {
+    const newerUserID = MessageID.ascending("msg_newer_user")
+    const newCompactionUser: SessionV1.WithParts = {
+      info: userInfo(NEW_COMPACTION_USER),
+      parts: [
+        {
+          ...basePart(NEW_COMPACTION_USER, "p1"),
+          type: "compaction",
+          auto: true,
+        },
+      ] as SessionV1.Part[],
+    }
+    const newerUser: SessionV1.WithParts = {
+      info: userInfo(newerUserID),
+      parts: [
+        {
+          ...basePart(newerUserID, "p1"),
+          type: "text",
+          text: "please continue",
+        },
+      ] as SessionV1.Part[],
+    }
+
+    const state = MessageV2.latest([
+      tailUser,
+      overflowAssistant,
+      compactionUser,
+      summaryAssistant,
+      continueUser,
+      newCompactionUser,
+      newerUser,
+    ])
+
+    expect(state.user?.id).toBe(newerUserID)
+    expect(state.tasks).toHaveLength(1)
+    expect(state.tasks[0]).toMatchObject({ type: "compaction", messageID: NEW_COMPACTION_USER })
   })
 })

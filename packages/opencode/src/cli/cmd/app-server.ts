@@ -67,6 +67,7 @@ type ServerInitializeResult = {
 type ProviderListResult = {
   readonly data: readonly ProviderInfo[]
   readonly default?: string
+  readonly configured?: readonly string[]
 }
 
 type ProviderInfo = {
@@ -76,6 +77,7 @@ type ProviderInfo = {
   readonly label: string
   readonly displayName: string
   readonly defaultModel?: string
+  readonly configured: boolean
   readonly source: string
   readonly capabilities: Record<string, unknown>
 }
@@ -195,6 +197,7 @@ type McpRemoteServerConfig = {
 type McpLocalServerConfig = {
   readonly type: "local"
   readonly command: readonly string[]
+  readonly env?: Record<string, string>
   readonly environment?: Record<string, string>
   readonly cwd?: string
   readonly disabled?: boolean
@@ -406,6 +409,9 @@ export type ActiveTurn = {
   assistantMessageIds?: Set<string>
   started?: boolean
   cancelRequested?: boolean
+  overflowCompaction?: "pending" | "started" | "completed"
+  overflowCompactionRequested?: boolean
+  overflowError?: unknown
   readonly modelSelection?: RouteModelSelection
   readonly contextWindow?: number
   readonly cleanup?: NotificationCleanup
@@ -622,38 +628,19 @@ export const AppServerCommand = effectCmd({
           const session = await routeData<RouteSession>("session.get", routeClient.session.get({ sessionID: params.sessionId }), {
             notFound: new AppServerError(-32010, `Session not found: ${params.sessionId}`),
           })
-          await routeApplyMcpServers(routeClient, session.directory, params.mcpServers, appliedMcpServers)
           ensureEventLoop(session.directory, emit)
           const turnId = params.turnId ?? randomUUID()
           const messageId = params.messageId ?? Identifier.ascending("message")
-          const selectedModel = routeModelSelection(params) ?? routeSessionModelSelection(session)
-          const providerCatalog = selectedModel ? await routeProviderCatalog(routeClient, session.directory) : undefined
-          if (selectedModel && providerCatalog) routeRequireModelSelection(providerCatalog, selectedModel)
-          const active: ActiveTurn = {
-            turnId,
-            sessionId: session.id,
-            content: [],
-            reasoning: [],
-            partLengths: new Map(),
-            toolStates: new Map(),
-            assistantMessageIds: new Set(),
-            started: false,
-            ...(selectedModel ? { modelSelection: selectedModel } : {}),
-            ...(selectedModel && providerCatalog
-              ? { contextWindow: routeModelContextWindow(providerCatalog, selectedModel) }
-              : {}),
-          }
-          const system = routeSystemPrompt(params, selectedModel)
-          const queued: QueuedTurn = {
-            active,
-            session,
-            messageId,
-            prompt: params.prompt,
-            ...(selectedModel ? { selectedModel } : {}),
-            ...(system ? { system } : {}),
-          }
           if (activeTurns.has(session.id) || routeQueuedTurns(queuedTurns, session.id).length > 0) {
-            routeEnqueueTurn(queuedTurns, queued)
+            const selectedModel = routeSessionModelSelection(session)
+            const providerCatalog = selectedModel ? await routeProviderCatalog(routeClient, session.directory) : undefined
+            const active = routeActiveTurn(turnId, session.id, selectedModel, providerCatalog)
+            routeEnqueueTurn(queuedTurns, {
+              active,
+              session,
+              messageId,
+              prompt: params.prompt,
+            })
             return {
               accepted: true,
               turnId,
@@ -663,6 +650,20 @@ export const AppServerCommand = effectCmd({
               messageId,
               delivery: "queue",
             }
+          }
+          await routeApplyMcpServers(routeClient, session.directory, params.mcpServers, appliedMcpServers)
+          const selectedModel = routeModelSelection(params) ?? routeSessionModelSelection(session)
+          const providerCatalog = selectedModel ? await routeProviderCatalog(routeClient, session.directory) : undefined
+          if (selectedModel && providerCatalog) routeRequireModelSelection(providerCatalog, selectedModel)
+          const active = routeActiveTurn(turnId, session.id, selectedModel, providerCatalog)
+          const system = routeSystemPrompt(params, selectedModel)
+          const queued: QueuedTurn = {
+            active,
+            session,
+            messageId,
+            prompt: params.prompt,
+            ...(selectedModel ? { selectedModel } : {}),
+            ...(system ? { system } : {}),
           }
           try {
             await routeSubmitTurn(routeClient, activeTurns, queued)
@@ -861,7 +862,7 @@ function routeMcpConfig(server: McpServerConfig): RouteMcpConfig {
     return {
       type: "local",
       command: [...server.command],
-      ...(server.environment ? { environment: server.environment } : {}),
+      ...(server.environment || server.env ? { environment: server.environment ?? server.env } : {}),
       ...(server.disabled === undefined ? {} : { enabled: !server.disabled }),
       ...(server.timeout === undefined ? {} : { timeout: server.timeout }),
     }
@@ -900,15 +901,17 @@ function routeMergeProviderCatalog(source: RouteProviderList, configured: RouteC
 
 function routeProviderListResult(source: RouteProviderList): ProviderListResult {
   const defaultProvider = Object.keys(source.default ?? {})[0]
+  const configured = new Set(source.connected ?? [])
   return {
     data: source.all
-      .map((provider) => routeProviderInfo(provider, source.default?.[provider.id]))
+      .map((provider) => routeProviderInfo(provider, source.default?.[provider.id], configured.has(provider.id)))
       .sort((a, b) => a.id.localeCompare(b.id)),
     ...(defaultProvider ? { default: defaultProvider } : {}),
+    ...(configured.size ? { configured: [...configured].sort() } : {}),
   }
 }
 
-function routeProviderInfo(provider: RouteProvider, defaultModel: string | undefined): ProviderInfo {
+function routeProviderInfo(provider: RouteProvider, defaultModel: string | undefined, configured: boolean): ProviderInfo {
   return {
     id: provider.id,
     value: provider.id,
@@ -916,9 +919,11 @@ function routeProviderInfo(provider: RouteProvider, defaultModel: string | undef
     label: provider.name,
     displayName: provider.name,
     ...(defaultModel ? { defaultModel } : {}),
+    configured,
     source: provider.source,
     capabilities: {
       source: provider.source,
+      configured,
       modelCount: Object.keys(provider.models ?? {}).length,
       env: provider.env ?? [],
       options: provider.options ?? {},
@@ -1073,6 +1078,28 @@ function routeSystemPrompt(params: InstructionParams, selected: RouteModelSelect
   return sections.length ? sections.join("\n\n") : undefined
 }
 
+function routeActiveTurn(
+  turnId: string,
+  sessionId: string,
+  selectedModel: RouteModelSelection | undefined,
+  providerCatalog: RouteProviderList | undefined,
+): ActiveTurn {
+  return {
+    turnId,
+    sessionId,
+    content: [],
+    reasoning: [],
+    partLengths: new Map(),
+    toolStates: new Map(),
+    assistantMessageIds: new Set(),
+    started: false,
+    ...(selectedModel ? { modelSelection: selectedModel } : {}),
+    ...(selectedModel && providerCatalog
+      ? { contextWindow: routeModelContextWindow(providerCatalog, selectedModel) }
+      : {}),
+  }
+}
+
 async function routeEventLoop(
   client: RouteClient,
   cwd: string,
@@ -1094,10 +1121,60 @@ async function routeEventLoop(
     for (const item of notifications) {
       emit(item.method, item.params)
     }
+    for (const item of notifications.filter((entry) => routeOverflowCompactionWarning(entry))) {
+      const sessionId = stringValue(item.params.sessionId)
+      if (sessionId) {
+        void routeStartOverflowCompaction(client, activeTurns, queuedTurns, sessionId, emit)
+      }
+    }
     for (const item of notifications.filter((entry) => entry.method === "turn/completed")) {
       const sessionId = stringValue(item.params.sessionId)
       if (sessionId) await routeStartNextQueuedTurn(client, activeTurns, queuedTurns, sessionId, emit)
     }
+  }
+}
+
+function routeOverflowCompactionWarning(notification: JsonRpcNotification) {
+  return (
+    notification.method === "turn/warning" &&
+    stringValue(notification.params.warningType) === "context_overflow" &&
+    stringValue(record(notification.params.action).id) === "compaction_auto"
+  )
+}
+
+async function routeStartOverflowCompaction(
+  client: RouteClient,
+  activeTurns: Map<string, ActiveTurn>,
+  queuedTurns: Map<string, QueuedTurn[]>,
+  sessionId: string,
+  emit: NotificationEmitter,
+) {
+  const turn = activeTurns.get(sessionId)
+  if (!turn || turn.overflowCompaction !== "pending" || turn.overflowCompactionRequested) return
+  turn.overflowCompactionRequested = true
+  try {
+    const session = await routeData<RouteSession>("session.get", client.session.get({ sessionID: sessionId }), {
+      notFound: new AppServerError(-32010, `Session not found: ${sessionId}`),
+    })
+    const selectedModel = turn.modelSelection ?? routeSessionModelSelection(session)
+    if (!selectedModel) throw new AppServerError(-32602, "automatic compaction requires provider/model or a session model.")
+    routeRequireModelSelection(await routeProviderCatalog(client, session.directory), selectedModel)
+    await routeCompactSession(client, session, selectedModel, true)
+  } catch (cause) {
+    const active = activeTurns.get(sessionId)
+    if (!active || active.turnId !== turn.turnId) return
+    await cleanupActiveTurn(activeTurns, sessionId)
+    const details = errorDetails("session.summarize", cause)
+    const eventError = { type: "unknown", message: details.message, data: details.data }
+    emit("turn/error", { ...turnBase(active), error: eventError })
+    emit("turn/completed", {
+      ...turnBase(active),
+      status: "failed",
+      content: active.content.join(""),
+      reasoning: active.reasoning.join(""),
+      error: eventError,
+    })
+    await routeStartNextQueuedTurn(client, activeTurns, queuedTurns, sessionId, emit)
   }
 }
 
@@ -1410,6 +1487,7 @@ function routeSessionStatusNotifications(
   if (stringValue(status.type) !== "idle") return []
   const turn = activeTurns.get(sessionId)
   if (!turn) return []
+  if (turn.overflowCompaction === "pending" || turn.overflowCompaction === "started") return []
   void cleanupActiveTurn(activeTurns, sessionId)
   return [
     notification("turn/completed", {
@@ -1484,6 +1562,11 @@ function routeQuestionResolvedNotifications(
 }
 
 function routeContextOverflowNotifications(turn: ActiveTurn, eventError: unknown): JsonRpcNotification[] {
+  if (turn.overflowCompaction !== "pending" && turn.overflowCompaction !== "started") {
+    turn.overflowCompactionRequested = false
+  }
+  turn.overflowCompaction = "pending"
+  turn.overflowError = eventError
   return [
     notification("turn/warning", {
       ...turnBase(turn),
@@ -1502,6 +1585,7 @@ function routeCompactionStartedNotifications(
   turn: ActiveTurn,
   properties: Record<string, unknown>,
 ): JsonRpcNotification[] {
+  turn.overflowCompaction = "started"
   return [
     notification("turn/compactionStarted", {
       ...turnBase(turn),
@@ -1527,6 +1611,8 @@ function routeCompactionCompletedNotifications(
   turn: ActiveTurn,
   properties: Record<string, unknown>,
 ): JsonRpcNotification[] {
+  turn.overflowCompaction = "completed"
+  turn.overflowCompactionRequested = false
   return [
     notification("turn/compactionCompleted", {
       ...turnBase(turn),
@@ -1540,6 +1626,8 @@ function routeCompactionCompletedNotifications(
 }
 
 function routeLegacyCompactedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  turn.overflowCompaction = "completed"
+  turn.overflowCompactionRequested = false
   return [
     notification("turn/compactionCompleted", {
       ...turnBase(turn),
@@ -2095,11 +2183,14 @@ function mcpServerConfig(value: unknown): McpServerConfig | undefined {
     const command = params.command.filter((item): item is string => typeof item === "string" && item.trim() !== "")
     if (command.length !== params.command.length || command.length === 0) return undefined
     const environment = optionalStringRecord(params.environment)
+    const env = optionalStringRecord(params.env)
     if (params.environment !== undefined && !environment) return undefined
+    if (params.env !== undefined && !env) return undefined
     if (params.cwd !== undefined && typeof params.cwd !== "string") return undefined
     return {
       type,
       command,
+      ...(env ? { env } : {}),
       ...(environment ? { environment } : {}),
       ...(typeof params.cwd === "string" && params.cwd.trim() ? { cwd: params.cwd } : {}),
       ...(params.disabled === undefined ? {} : { disabled: params.disabled }),
