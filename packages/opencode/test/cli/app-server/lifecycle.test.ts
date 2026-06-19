@@ -1769,6 +1769,171 @@ test("app-server translates compaction events into context notifications", () =>
   ])
 })
 
+test("app-server translates route summary compaction messages into context notifications", () => {
+  const activeTurns = new Map<string, ActiveTurn>([
+    [
+      "ses_test",
+      {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        content: [],
+        reasoning: [],
+      },
+    ],
+  ])
+
+  const started = turnNotifications(activeTurns, {
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_test",
+      info: {
+        id: "msg_compact",
+        role: "assistant",
+        sessionID: "ses_test",
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const idleDuringCompaction = turnNotifications(activeTurns, {
+    type: "session.status",
+    properties: {
+      sessionID: "ses_test",
+      status: { type: "idle" },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const delta = turnNotifications(activeTurns, {
+    type: "message.part.delta",
+    properties: {
+      sessionID: "ses_test",
+      messageID: "msg_compact",
+      partID: "prt_compact",
+      field: "text",
+      delta: "Compacted",
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const completed = turnNotifications(activeTurns, {
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_test",
+      part: {
+        id: "prt_compact",
+        messageID: "msg_compact",
+        sessionID: "ses_test",
+        type: "text",
+        text: "Compacted summary.",
+        time: {
+          start: 1,
+          end: 2,
+        },
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+  const duplicateCompleted = turnNotifications(activeTurns, {
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_test",
+      info: {
+        id: "msg_compact",
+        role: "assistant",
+        sessionID: "ses_test",
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        time: {
+          completed: 2,
+        },
+      },
+    },
+  } as Parameters<typeof turnNotifications>[1])
+
+  expect(started).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/compactionStarted",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        compactionId: "msg_compact",
+        messageId: "msg_compact",
+        reason: "auto",
+      },
+    },
+  ])
+  expect(idleDuringCompaction).toEqual([])
+  expect(delta).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/compactionDelta",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        compactionId: "msg_compact",
+        messageId: "msg_compact",
+        delta: "Compacted",
+      },
+    },
+  ])
+  expect(completed).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/compactionDelta",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        compactionId: "msg_compact",
+        messageId: "msg_compact",
+        delta: " summary.",
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      method: "turn/compactionCompleted",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        compactionId: "msg_compact",
+        messageId: "msg_compact",
+        reason: "auto",
+        summary: "Compacted summary.",
+      },
+    },
+  ])
+  expect(duplicateCompleted).toEqual([])
+  expect(
+    turnNotifications(activeTurns, {
+      type: "session.status",
+      properties: {
+        sessionID: "ses_test",
+        status: { type: "idle" },
+      },
+    } as Parameters<typeof turnNotifications>[1]),
+  ).toEqual([
+    {
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: {
+        turnId: "turn_test",
+        sessionId: "ses_test",
+        providerSessionId: "ses_test",
+        threadId: "ses_test",
+        status: "completed",
+        content: "",
+        reasoning: "",
+      },
+    },
+  ])
+})
+
 test("app-server translates route part deltas without final snapshot duplication", () => {
   const activeTurns = new Map<string, ActiveTurn>([
     [

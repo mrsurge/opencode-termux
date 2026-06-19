@@ -55,7 +55,9 @@ _OPENROUTER_MODEL_CACHE: Dict[Tuple[str, str, str], Tuple[float, List[Dict[str, 
 _TE2_MCP_SERVER_NAME = "te2-mcp"
 _TE2_MCP_STREAMABLE_HTTP_ROUTE = "/te2_mcp_http"
 _AGENT_PTY_BLOCKS_MCP_SERVER_NAME = "agent-pty-blocks"
-_AGENT_PTY_BLOCKS_TIMEOUT_MS = 100_000 * 60 * 1000
+# Bun/Node timers overflow above this signed 32-bit millisecond ceiling.
+_JS_TIMER_MAX_TIMEOUT_MS = 2_147_483_647
+_AGENT_PTY_BLOCKS_TIMEOUT_MS = _JS_TIMER_MAX_TIMEOUT_MS
 _DEVINS_CONTEXT_SETTINGS_KEY = "__als_devins_context__"
 
 

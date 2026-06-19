@@ -407,6 +407,10 @@ export type ActiveTurn = {
   partTypes?: Map<string, string>
   toolStates?: Map<string, string>
   assistantMessageIds?: Set<string>
+  compactionMessageIds?: Set<string>
+  compactionPartLengths?: Map<string, number>
+  compactionTextByMessageId?: Map<string, string>
+  completedCompactionMessageIds?: Set<string>
   started?: boolean
   cancelRequested?: boolean
   overflowCompaction?: "pending" | "started" | "completed"
@@ -1318,6 +1322,7 @@ function routeEventSessionID(type: string | undefined, properties: Record<string
 function routeMessageUpdatedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
   const info = record(properties.info)
   if (stringValue(info.role) !== "assistant") return []
+  if (routeMessageIsCompaction(info)) return routeCompactionMessageUpdatedNotifications(turn, info)
   if (info.summary === true) return []
   const messageId = stringValue(info.id)
   if (messageId) {
@@ -1346,10 +1351,35 @@ function routeMessageUpdatedNotifications(turn: ActiveTurn, properties: Record<s
   ]
 }
 
+function routeMessageIsCompaction(info: Record<string, unknown>) {
+  return info.summary === true && stringValue(info.mode) === "compaction" && stringValue(info.agent) === "compaction"
+}
+
+function routeCompactionMessageUpdatedNotifications(turn: ActiveTurn, info: Record<string, unknown>): JsonRpcNotification[] {
+  const messageId = stringValue(info.id)
+  if (!messageId) return []
+  const compactionMessageIds = turn.compactionMessageIds ?? new Set<string>()
+  turn.compactionMessageIds = compactionMessageIds
+  compactionMessageIds.add(messageId)
+  if (numberValue(record(info.time).completed) !== undefined) return routeCompletedCompactionNotifications(turn, messageId, "auto")
+  if (turn.overflowCompaction === "started") return []
+  turn.overflowCompaction = "started"
+  return [
+    notification("turn/compactionStarted", {
+      ...turnBase(turn),
+      compactionId: messageId,
+      messageId,
+      reason: "auto",
+    }),
+  ]
+}
+
 function routePartUpdatedNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
   const part = record(properties.part)
   const messageId = stringValue(part.messageID)
-  if (!messageId || !turn.assistantMessageIds?.has(messageId)) return []
+  if (!messageId) return []
+  if (turn.compactionMessageIds?.has(messageId)) return routeCompactionPartUpdatedNotifications(turn, part)
+  if (!turn.assistantMessageIds?.has(messageId)) return []
   const type = stringValue(part.type)
   const partId = stringValue(part.id)
   if (partId && type) {
@@ -1366,7 +1396,9 @@ function routePartUpdatedNotifications(turn: ActiveTurn, properties: Record<stri
 
 function routePartDeltaNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
   const messageId = stringValue(properties.messageID)
-  if (!messageId || !turn.assistantMessageIds?.has(messageId)) return []
+  if (!messageId) return []
+  if (turn.compactionMessageIds?.has(messageId)) return routeCompactionPartDeltaNotifications(turn, properties)
+  if (!turn.assistantMessageIds?.has(messageId)) return []
   if (stringValue(properties.field) !== "text") return []
   const partId = stringValue(properties.partID)
   const delta = stringValue(properties.delta)
@@ -1382,6 +1414,58 @@ function routePartDeltaNotifications(turn: ActiveTurn, properties: Record<string
   }
   turn.reasoning.push(delta)
   return [notification("turn/thoughtDelta", { ...turnBase(turn), delta, reasoningId: partId })]
+}
+
+function routeCompactionPartUpdatedNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
+  if (stringValue(part.type) !== "text") return []
+  const messageId = stringValue(part.messageID)
+  const partId = stringValue(part.id)
+  if (!messageId || !partId) return []
+  const text = stringValue(part.text) ?? ""
+  const lengths = turn.compactionPartLengths ?? new Map<string, number>()
+  turn.compactionPartLengths = lengths
+  const previous = lengths.get(partId) ?? 0
+  const notifications: JsonRpcNotification[] = []
+  if (text.length > previous) {
+    lengths.set(partId, text.length)
+    const delta = text.slice(previous)
+    notifications.push(notification("turn/compactionDelta", { ...turnBase(turn), compactionId: messageId, messageId, delta }))
+  }
+  const summaries = turn.compactionTextByMessageId ?? new Map<string, string>()
+  turn.compactionTextByMessageId = summaries
+  summaries.set(messageId, text)
+  if (numberValue(record(part.time).end) !== undefined) notifications.push(...routeCompletedCompactionNotifications(turn, messageId, "auto"))
+  return notifications
+}
+
+function routeCompactionPartDeltaNotifications(turn: ActiveTurn, properties: Record<string, unknown>): JsonRpcNotification[] {
+  if (stringValue(properties.field) !== "text") return []
+  const messageId = stringValue(properties.messageID)
+  const partId = stringValue(properties.partID)
+  const delta = stringValue(properties.delta)
+  if (!messageId || !partId || !delta) return []
+  const lengths = turn.compactionPartLengths ?? new Map<string, number>()
+  turn.compactionPartLengths = lengths
+  lengths.set(partId, (lengths.get(partId) ?? 0) + delta.length)
+  return [notification("turn/compactionDelta", { ...turnBase(turn), compactionId: messageId, messageId, delta })]
+}
+
+function routeCompletedCompactionNotifications(turn: ActiveTurn, messageId: string, reason: string): JsonRpcNotification[] {
+  const completed = turn.completedCompactionMessageIds ?? new Set<string>()
+  turn.completedCompactionMessageIds = completed
+  if (completed.has(messageId)) return []
+  completed.add(messageId)
+  turn.overflowCompaction = "completed"
+  turn.overflowCompactionRequested = false
+  return [
+    notification("turn/compactionCompleted", {
+      ...turnBase(turn),
+      compactionId: messageId,
+      messageId,
+      reason,
+      summary: turn.compactionTextByMessageId?.get(messageId) ?? "",
+    }),
+  ]
 }
 
 function routeTextPartNotifications(turn: ActiveTurn, part: Record<string, unknown>): JsonRpcNotification[] {
