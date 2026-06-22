@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline"
 import { randomUUID } from "node:crypto"
 import fs from "node:fs"
-import { EOL } from "os"
+import { EOL, homedir } from "os"
 import { Effect } from "effect"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { effectCmd } from "../effect-cmd"
@@ -2634,7 +2634,8 @@ function appServerBuiltinPrompt(model: RouteModelSelection | undefined, hostPlat
 }
 
 function resolveCwd(cwd: string) {
-  const resolved = fs.realpathSync(cwd)
+  const input = cwd === "~" ? homedir() : cwd.startsWith("~/") ? `${homedir()}${cwd.slice(1)}` : cwd
+  const resolved = fs.realpathSync(input)
   if (!fs.statSync(resolved).isDirectory()) throw new Error("Session cwd is not a directory.")
   return resolved
 }

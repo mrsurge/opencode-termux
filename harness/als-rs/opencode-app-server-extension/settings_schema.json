@@ -67,7 +67,8 @@
       "dynamic_source": "/api/extensions/opencode-app-server/models",
       "source_method": "extension.models.list",
       "source_params": {
-        "provider": "$field.provider"
+        "provider": "$field.provider",
+        "cwd": "$field.cwd"
       },
       "depends_on": ["provider"],
       "refresh_on": ["provider"],

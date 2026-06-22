@@ -79,6 +79,13 @@ describe("opencode app-server subprocess", () => {
         })
         const providerData = (providers as { result: { data: unknown[] } }).result.data
         expect(providerData.length).toBeGreaterThan(0)
+        yield* appServer.send({ jsonrpc: "2.0", id: 41, method: "provider/list", params: { cwd: "~" } })
+        const providersFromHome = yield* appServer.receive.pipe(Effect.timeout(Duration.seconds(10)))
+        expect(providersFromHome).toMatchObject({
+          jsonrpc: "2.0",
+          id: 41,
+        })
+        expect((providersFromHome as { result: { data: unknown[] } }).result.data.length).toBeGreaterThan(0)
         const catalogProvider = objectRecord(providerData.find((item) => stringField(objectRecord(item) ?? {}, "id") === "openrouter")) ?? objectRecord(providerData[0])
         if (!catalogProvider) throw new Error("provider/list returned no provider records")
         const catalogProviderId = stringField(catalogProvider, "id")

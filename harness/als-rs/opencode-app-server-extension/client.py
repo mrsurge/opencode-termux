@@ -152,13 +152,23 @@ def _active_session_name(
     return _new_active_session_name(settings)
 
 
-def _cwd_from_settings(settings: Optional[Dict[str, object]], cwd: Optional[str] = None) -> str:
+def _normalize_cwd_value(cwd: Optional[str]) -> Optional[str]:
     if isinstance(cwd, str) and cwd.strip():
-        return cwd.strip()
+        value = cwd.strip()
+        if value == "~" or value.startswith("~/"):
+            return str(Path(value).expanduser())
+        return value
+    return None
+
+
+def _cwd_from_settings(settings: Optional[Dict[str, object]], cwd: Optional[str] = None) -> str:
+    explicit_cwd = _normalize_cwd_value(cwd)
+    if explicit_cwd:
+        return explicit_cwd
     if isinstance(settings, dict):
-        raw = settings.get("cwd")
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip()
+        settings_cwd = _normalize_cwd_value(_string_value(settings.get("cwd")))
+        if settings_cwd:
+            return settings_cwd
     return str(Path.cwd())
 
 
@@ -1567,7 +1577,7 @@ def _schema_config_success_response(config: Dict[str, object], message: str) -> 
 async def _schema_current_provider_list(
     params: Dict[str, object],
 ) -> Dict[str, object]:
-    cwd = _string_value(params.get("cwd")) or None
+    cwd = _normalize_cwd_value(_string_value(params.get("cwd")))
     transport = await _ensure_transport_ready(cwd)
     result = await transport.rpc_request(
         "provider/list",
@@ -1910,12 +1920,19 @@ def _normalize_reasoning_efforts(raw_efforts: object) -> List[Dict[str, object]]
 async def _schema_model_variants_list(params: Dict[str, object]) -> Dict[str, object]:
     provider = _string_value(params.get("provider"), params.get("providerID"))
     model = _string_value(params.get("model"), params.get("modelID"))
-    cwd = _string_value(params.get("cwd"))
+    cwd = _normalize_cwd_value(_string_value(params.get("cwd")))
+    if not provider or not model:
+        return {
+            "ok": True,
+            "kind": "list",
+            "items": [],
+            "variants": [],
+            "default": "",
+            "count": 0,
+        }
     rpc_params: Dict[str, object] = {}
-    if provider:
-        rpc_params["provider"] = provider
-    if model:
-        rpc_params["model"] = model
+    rpc_params["provider"] = provider
+    rpc_params["model"] = model
     if cwd:
         rpc_params["cwd"] = cwd
     transport = await _ensure_transport_ready(cwd or None)
@@ -1934,10 +1951,10 @@ async def _schema_model_variants_list(params: Dict[str, object]) -> Dict[str, ob
 
 async def list_models(**params: object) -> Dict[str, object]:
     provider_filter = _string_value(params.get("provider"))
-    cwd = _string_value(params.get("cwd"))
-    rpc_params: Dict[str, object] = {}
-    if provider_filter:
-        rpc_params["provider"] = provider_filter
+    cwd = _normalize_cwd_value(_string_value(params.get("cwd")))
+    if not provider_filter:
+        return {"models": [], "items": [], "default": ""}
+    rpc_params: Dict[str, object] = {"provider": provider_filter}
     if cwd:
         rpc_params["cwd"] = cwd
     transport = await _ensure_transport_ready(cwd or None)
@@ -1953,14 +1970,6 @@ async def list_models(**params: object) -> Dict[str, object]:
         model_leaf = _string_value(model.get("model"), model.get("modelID"))
         display_name = _string_value(model.get("displayName"), model.get("name"), model_id)
         description = f"{model_leaf or model_id} via {provider_id}" if provider_id else model_id
-        efforts = _normalize_reasoning_efforts(
-            model.get("supported_reasoning_efforts")
-            or model.get("supportedReasoningEfforts")
-        )
-        default_effort = _string_value(
-            model.get("default_reasoning_effort"),
-            model.get("defaultReasoningEffort"),
-        )
         models.append({
             "id": model_id,
             "value": model_id,
@@ -1972,12 +1981,6 @@ async def list_models(**params: object) -> Dict[str, object]:
             "providerID": provider_id,
             "model": model_leaf,
             "modelID": model_leaf,
-            "supported_reasoning_efforts": efforts,
-            "supportedReasoningEfforts": efforts,
-            "default_reasoning_effort": default_effort,
-            "defaultReasoningEffort": default_effort,
-            "capabilities": model.get("capabilities"),
-            "raw": model,
         })
     default = result.get("default")
     return {"models": models, "items": models, "default": default if isinstance(default, str) else ""}
