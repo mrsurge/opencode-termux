@@ -2,10 +2,13 @@
 set -euo pipefail
 
 APP="opencode-app-server"
+SOURCE_REPO="https://github.com/mrsurge/opencode-termux.git"
+SOURCE_BRANCH="app-server-stdio"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$REPO_ROOT/packages/opencode"
 INSTALL_DIR="${OPENCODE_APP_SERVER_INSTALL_DIR:-$HOME/.local/bin}"
 BASHRC="${OPENCODE_APP_SERVER_BASHRC:-$HOME/.bashrc}"
+ORIGINAL_ARGS=("$@")
 
 usage() {
   cat <<EOF
@@ -31,7 +34,28 @@ The installed binary uses the normal OpenCode CLI entrypoint. Start the stdio
 app-server with:
 
   opencode-app-server app-server
+
+When the script is not already inside an OpenCode source checkout, it clones:
+
+  git clone $SOURCE_REPO -b $SOURCE_BRANCH --single-branch --depth=1
+
+The temporary clone is created under \$TMPDIR when set, otherwise /tmp.
 EOF
+}
+
+resolve_tmp_root() {
+  local candidate
+  for candidate in "${TMPDIR:-}" /tmp; do
+    if [[ -z "$candidate" ]]; then
+      continue
+    fi
+    if [[ -d "$candidate" && -w "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "Error: no writable temp directory found. Set TMPDIR or create /tmp." >&2
+  exit 1
 }
 
 build_args=()
@@ -70,8 +94,21 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 if [[ ! -d "$PACKAGE_DIR" ]]; then
-  echo "Error: packages/opencode was not found under $REPO_ROOT." >&2
-  exit 1
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Error: git must be installed and available in PATH to clone $SOURCE_REPO." >&2
+    exit 1
+  fi
+
+  tmp_root="$(resolve_tmp_root)"
+  work_dir="$(mktemp -d "$tmp_root/opencode-app-server-install.XXXXXX")"
+  cleanup() {
+    rm -rf "$work_dir"
+  }
+  trap cleanup EXIT
+
+  git clone "$SOURCE_REPO" -b "$SOURCE_BRANCH" --single-branch --depth=1 "$work_dir/opencode-termux"
+  "$work_dir/opencode-termux/install-opencode-app-server" "${ORIGINAL_ARGS[@]}"
+  exit $?
 fi
 
 mkdir -p "$INSTALL_DIR"
