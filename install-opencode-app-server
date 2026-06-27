@@ -76,6 +76,9 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
+cd "$REPO_ROOT"
+bun install --frozen-lockfile
+
 cd "$PACKAGE_DIR"
 bun run script/build.ts --single "${build_args[@]}"
 
