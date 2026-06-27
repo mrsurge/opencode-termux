@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP="opencode-app-server"
+SOURCE_REPO="https://github.com/mrsurge/opencode-termux.git"
+SOURCE_BRANCH="app-server-stdio"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_DIR="$REPO_ROOT/packages/opencode"
+INSTALL_DIR="${OPENCODE_APP_SERVER_INSTALL_DIR:-$HOME/.local/bin}"
+BASHRC="${OPENCODE_APP_SERVER_BASHRC:-$HOME/.bashrc}"
+ORIGINAL_ARGS=("$@")
+
+usage() {
+  cat <<EOF
+OpenCode app-server binary installer
+
+Usage: ./install-opencode-app-server [options]
+
+Options:
+  -h, --help              Show this help message.
+      --install-dir DIR   Install the compiled binary into DIR.
+      --build-arg ARG     Pass one additional argument to packages/opencode/script/build.ts.
+
+Environment:
+  OPENCODE_APP_SERVER_INSTALL_DIR  Install directory. Defaults to \$HOME/.local/bin.
+  OPENCODE_APP_SERVER_BASHRC       Shell rc file to update. Defaults to \$HOME/.bashrc.
+
+This script uses the first bun found in PATH, builds the self-contained OpenCode
+binary for the current platform, and installs that binary as:
+
+  \$OPENCODE_APP_SERVER_INSTALL_DIR/opencode-app-server
+
+The installed binary uses the normal OpenCode CLI entrypoint. Start the stdio
+app-server with:
+
+  opencode-app-server app-server
+
+If an opencode-app-server file already exists in the install directory, the
+newly built binary replaces it.
+
+When the script is not already inside an OpenCode source checkout, it clones:
+
+  git clone $SOURCE_REPO -b $SOURCE_BRANCH --single-branch --depth=1
+
+The temporary clone is created under \$TMPDIR when set, otherwise /tmp.
+EOF
+}
+
+resolve_tmp_root() {
+  local candidate
+  for candidate in "${TMPDIR:-}" /tmp; do
+    if [[ -z "$candidate" ]]; then
+      continue
+    fi
+    if [[ -d "$candidate" && -w "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "Error: no writable temp directory found. Set TMPDIR or create /tmp." >&2
+  exit 1
+}
+
+build_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --install-dir)
+      if [[ -z "${2:-}" ]]; then
+        echo "Error: --install-dir requires a directory." >&2
+        exit 1
+      fi
+      INSTALL_DIR="$2"
+      shift 2
+      ;;
+    --build-arg)
+      if [[ -z "${2:-}" ]]; then
+        echo "Error: --build-arg requires a value." >&2
+        exit 1
+      fi
+      build_args+=("$2")
+      shift 2
+      ;;
+    *)
+      echo "Error: unknown option '$1'." >&2
+      exit 1
+      ;;
+  esac
+done
+
+if ! command -v bun >/dev/null 2>&1; then
+  echo "Error: bun must be installed and available in PATH." >&2
+  exit 1
+fi
+
+if [[ ! -d "$PACKAGE_DIR" ]]; then
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Error: git must be installed and available in PATH to clone $SOURCE_REPO." >&2
+    exit 1
+  fi
+
+  tmp_root="$(resolve_tmp_root)"
+  work_dir="$(mktemp -d "$tmp_root/opencode-app-server-install.XXXXXX")"
+  cleanup() {
+    rm -rf "$work_dir"
+  }
+  trap cleanup EXIT
+
+  git clone "$SOURCE_REPO" -b "$SOURCE_BRANCH" --single-branch --depth=1 "$work_dir/opencode-termux"
+  "$work_dir/opencode-termux/install-opencode-app-server" "${ORIGINAL_ARGS[@]}"
+  exit $?
+fi
+
+mkdir -p "$INSTALL_DIR"
+
+cd "$REPO_ROOT"
+bun install --frozen-lockfile
+
+cd "$PACKAGE_DIR"
+bun run script/build.ts --single "${build_args[@]}"
+
+mapfile -t candidates < <(find "$PACKAGE_DIR/dist" -path "*/bin/opencode" -type f | sort)
+if [[ "${#candidates[@]}" -ne 1 ]]; then
+  echo "Error: expected exactly one compiled opencode binary, found ${#candidates[@]}." >&2
+  printf '%s\n' "${candidates[@]}" >&2
+  exit 1
+fi
+
+target="$INSTALL_DIR/$APP"
+existing="Installed"
+if [[ -e "$target" || -L "$target" ]]; then
+  existing="Updated"
+fi
+tmp_target="$(mktemp "$INSTALL_DIR/$APP.XXXXXX")"
+cp "${candidates[0]}" "$tmp_target"
+chmod 755 "$tmp_target"
+mv -f "$tmp_target" "$target"
+
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *)
+    mkdir -p "$(dirname "$BASHRC")"
+    touch "$BASHRC"
+    if ! grep -F "export PATH=\"$INSTALL_DIR:\$PATH\"" "$BASHRC" >/dev/null 2>&1; then
+      {
+        printf '\n'
+        printf '# Added by OpenCode app-server installer\n'
+        printf 'export PATH="%s:$PATH"\n' "$INSTALL_DIR"
+      } >> "$BASHRC"
+    fi
+    echo "Added $INSTALL_DIR to PATH in $BASHRC. Restart your shell or source that file."
+    ;;
+esac
+
+echo "$existing $APP to $target"
+echo "Run app-server mode with: $APP app-server"

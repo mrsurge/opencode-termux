@@ -1453,6 +1453,41 @@ describe("session.compaction.process", () => {
     { git: true },
   )
 
+  itCompaction.instance(
+    "does not summarize user messages after a stale compaction marker",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(
+        reply("summary", (input) => {
+          captured = JSON.stringify(input.messages)
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "before stale marker")
+        yield* createCompactionMarker(session.id)
+        const msgsWithMarker = yield* ssn.messages({ sessionID: session.id })
+        const marker = msgsWithMarker.at(-1)?.info.id
+        expect(marker).toBeTruthy()
+        yield* createUserMessage(session.id, "normal prompt after stale marker")
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        yield* SessionCompaction.use.process({ parentID: marker!, messages: msgs, sessionID: session.id, auto: false })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const summary = all.find((msg) => msg.info.role === "assistant" && msg.info.summary)
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role === "assistant") expect(summary.info.parentID).toBe(marker!)
+        expect(captured).toContain("before stale marker")
+        expect(captured).not.toContain("normal prompt after stale marker")
+      }).pipe(withCompaction({ llm: stub.layer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
   itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
     const stub = llm()
     stub.push(reply("summary one"))

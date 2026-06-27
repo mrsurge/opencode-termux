@@ -1,0 +1,3 @@
+[submodule "harness/als-rs/opencode-app-server-extension"]
+	path = harness/als-rs/opencode-app-server-extension
+	url = https://github.com/mrsurge/opencode-app-server-extension.git
